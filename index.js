@@ -111,6 +111,18 @@ export function installFrontendTokenizer(jQueryLike) {
     // Read at call time so the toggle can be flipped after installation.
     const isEnabled = () => globalThis.__TT_FRONTEND_TOKENIZER__?.enabled !== false;
 
+    // Runtime stats for quick verification (see README):
+    // __TT_FRONTEND_TOKENIZER__.stats -> { intercepted, passedThrough, disabledAt }
+    const stats = globalThis.__TT_FRONTEND_TOKENIZER__?.stats ?? {
+        intercepted: 0,
+        passedThrough: 0,
+        installedAt: new Date().toISOString(),
+    };
+    globalThis.__TT_FRONTEND_TOKENIZER__ = {
+        ...(globalThis.__TT_FRONTEND_TOKENIZER__ ?? {}),
+        stats,
+    };
+
     /**
      * @returns {object|null} Mock response data, or null when the call must
      * be passed through to the real backend.
@@ -164,6 +176,7 @@ export function installFrontendTokenizer(jQueryLike) {
             }
 
             if (responseData) {
+                stats.intercepted += 1;
                 if (typeof settings.success === 'function') {
                     // Synchronous invocation also satisfies the deprecated
                     // async:false call sites that read closure variables
@@ -179,12 +192,28 @@ export function installFrontendTokenizer(jQueryLike) {
             }
         }
 
+        stats.passedThrough += 1;
         return originalAjax.apply(this, arguments);
     };
     patchedAjax.__ttFrontendTokenizer = true;
     jQueryLike.ajax = patchedAjax;
     console.log('[Frontend Tokenizer] Patched jQuery.ajax; token counting is now estimated locally');
+    announceInstall();
     return true;
+}
+
+/**
+ * User-visible confirmation so success is observable without dev tools.
+ */
+function announceInstall() {
+    try {
+        const toastr = globalThis.toastr;
+        if (toastr && typeof toastr.info === 'function') {
+            toastr.info('前端 Token 估算已启用（v2.1.0）', 'Frontend Token Estimator', { timeOut: 8000 });
+        }
+    } catch {
+        // Notifications are best-effort only.
+    }
 }
 
 if (typeof globalThis.jQuery !== 'undefined') {

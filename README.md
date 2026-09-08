@@ -33,13 +33,20 @@ Chat Completion 的提示词组装按"每条消息一次请求"计数 token：`M
 
 控制台出现 `[Frontend Tokenizer] Patched jQuery.ajax` 即生效。可在 Extensions 面板开关。
 
+## 验证是否生效
+
+1. **启动通知**：v2.1.0 起加载成功时会弹 toast「前端 Token 估算已启用（v2.1.0）」——无开发者工具也能确认
+2. **速度**：切换到另一个模型（使 token 缓存失效）后在长聊天中生成，组装应从 ~20 秒变为即时
+3. **数值**：启用/禁用扩展（刷新后）对比顶栏上下文 token 总数，估算值与精确值不同（中文内容明显偏高）
+4. **运行时统计**（桌面端 F12 控制台）：
+   ```js
+   __TT_FRONTEND_TOKENIZER__.stats   // { intercepted, passedThrough, ... }
+   __TT_FRONTEND_TOKENIZER__.enabled = false  // 临时关闭对比，刷新后生效
+   ```
+
 ## 权衡
 
-计数从精确值变为估算值。对英文基本精确；对中文偏保守（高估约 40%），效果是上下文预算裁剪更早触发——宁可少塞几楼，不会超限。如需对比真实计数：
-
-```js
-__TT_FRONTEND_TOKENIZER__.enabled = false  // 然后刷新页面
-```
+计数从精确值变为估算值。对英文基本精确；对中文偏保守（高估约 40%），效果是上下文预算裁剪更早触发——宁可少塞几楼，不会超限。
 
 ## 许可
 
