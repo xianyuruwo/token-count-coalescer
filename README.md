@@ -32,6 +32,7 @@ Chat Completion 的提示词组装按"每条消息一次请求"计数 token：`M
 - 内容未变的聊天再次组装（重试、提示词查看器重复打开、重新生成、滑动）→ **整批缓存命中，跳过 Rust 调用**
 - v3.4.0：**局部命中**——聊天追加新消息后，只有新增/变化的消息重新跑正则，其余直接从缓存合并（日常每轮发送只付增量成本）
 - v3.5.0：**跨会话持久化**——缓存写入 localStorage（按扩展版本分桶、4MB 预算、LRU 淘汰），重启应用后首次组装也直接命中，不再付 60s 冷启动成本；消息文本或正则脚本变更会自然失效（键含全部输入）
+- v3.6.0：**默认静默**——移除剖析弹窗与悬浮按钮（诊断功能按需开启），零打扰
 - 缓存的是真实的 Rust 输出，非估算——语义零改变；失败批不缓存
 - 报告 toast 会显示「正则批处理缓存命中 N 次」
 
@@ -70,15 +71,31 @@ Chat Completion 的提示词组装按"每条消息一次请求"计数 token：`M
 
 ## 验证是否生效
 
-1. **启动通知**：加载成功时弹 toast「前端 Token 估算已启用（v3.5.0）」
-2. **诊断 toast**：首次大量计数后一次性报告拦截状态（拦截生效 / 部分生效 / 拦截未生效）
-3. **性能剖析**：慢操作结束后自动弹「TT 性能剖析」，点 Σ 按钮随时重看
-4. **运行时统计**（桌面端 F12 控制台）：
+**v3.6.0 起默认静默运行**：不再弹任何 toast，悬浮 Σ 按钮与性能剖析器默认关闭（剖析打点本身有少量开销，测试完毕已移除）。
+
+按需开启诊断（桌面 F12 控制台）：
+- 性能剖析 + Σ 按钮：`localStorage.setItem('tt:fte:profile', '1'); location.reload();`
+- toast 通知（安装/补丁恢复/剖析报告）：`__TT_FRONTEND_TOKENIZER__.notify = true`
+- 关闭剖析：`localStorage.removeItem('tt:fte:profile'); location.reload();`
+
+核心功能（token 估算 + 正则批处理缓存）始终静默工作，无需任何提示。
+
+## 缓存与数据删除
+
+正则批处理缓存**按内容寻址**（键 = 消息文本 + 脚本集哈希），跨聊天共享，**不按会话建立索引**——删除某个聊天时不会（也无法按会话）删除对应缓存条目。安全性由以下保证：
+- 缓存仅含"相同输入必产生相同输出"的正则结果，键覆盖全部输入，跨聊天复用语义零风险
+- 内存上限 16MB / 持久化 4MB，LRU 淘汰；删除聊天后的残留条目会随新内容自然挤出
+- 在意残留可手动清空：`__TT_FRONTEND_TOKENIZER__.clearRegexCache()`
+
+token 估算缓存则复用应用的本地 token 缓存（按 chatId 分桶），删除聊天时由应用自行清理。
+
+## 运行时统计（诊断开启时）
+
    ```js
    __TT_FRONTEND_TOKENIZER__.stats     // { intercepted, passedThrough, reasserted, ... }
-   __TT_FRONTEND_TOKENIZER__.profile() // 性能剖析快照
-   __TT_FRONTEND_TOKENIZER__.clearRegexCache()  // 怀疑正则缓存陈旧时清空（内存+本地存储）
-   __TT_FRONTEND_TOKENIZER__.enabled = false  // 临时关闭对比，刷新后生效
+   __TT_FRONTEND_TOKENIZER__.profile() // 性能剖析快照（需开启 profile）
+   __TT_FRONTEND_TOKENIZER__.clearRegexCache()  // 清空正则缓存（内存+本地存储）
+   __TT_FRONTEND_TOKENIZER__.enabled = false  // 临时关闭估算，刷新后生效
    ```
 
 ## 权衡

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Frontend Token Count Estimator for TauriTavern
  *
  * Inspired by ST-Frontend-Tokenizer (https://github.com/GoldenglowMeow/ST-Frontend-Tokenizer, MIT).
@@ -62,7 +62,31 @@
 const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
 const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
 const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
-const EXTENSION_VERSION = '3.5.1';
+const EXTENSION_VERSION = '3.6.0';
+
+/**
+ * Diagnostics are off by default. Re-enable on demand (desktop console):
+ *   localStorage.setItem('tt:fte:profile', '1'); location.reload();   // profiler + Σ button
+ *   __TT_FRONTEND_TOKENIZER__.notify = true                            // toasts (live toggle)
+ */
+function isProfileEnabled() {
+    try {
+        if (globalThis.localStorage?.getItem('tt:fte:profile') === '1') {
+            return true;
+        }
+    } catch {
+        // Ignore storage failures.
+    }
+    return false;
+}
+
+/** Read live so the flag can be toggled without a reload. */
+function isNotificationEnabled() {
+    if (globalThis.__TT_FRONTEND_TOKENIZER__?.notify === true) {
+        return true;
+    }
+    return false;
+}
 /** Invoke-broker commands whose counters reveal backend-side token counting. */
 const BACKEND_COUNT_COMMANDS = ['count_openai_tokens', 'count_openai_tokens_batch'];
 /** Profiler: report once a window accumulates this much busy time (ms). */
@@ -156,8 +180,11 @@ function showNotification(message, timeOut = 10_000) {
     }
 }
 
-/** Announces activation once per page load. */
+/** Announces activation once per page load (silent unless notifications enabled). */
 function announceInstall() {
+    if (!isNotificationEnabled()) {
+        return;
+    }
     const state = globalThis.__TT_FRONTEND_TOKENIZER__;
     if (state?.announced) {
         return;
@@ -1016,7 +1043,7 @@ export function profileTauriInvoke(profiler, tauriLike = globalThis.__TAURI__, s
                 return result;
             }
             const label = `direct:${command}`;
-            const record = (ms) => profiler.recordInvoke(label, ms);
+            const record = (ms) => profiler?.recordInvoke?.(label, ms);
             try {
                 Promise.resolve(result).finally(() => {
                     record((typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
@@ -1092,7 +1119,7 @@ export function profileInvokeBroker(profiler, abiLike = globalThis.__TAURITAVERN
             const returned = isPartial
                 ? settled.then((response) => {
                     const merged = mergePartialRegexResponse(regexPlan, regexCache, args, response);
-                    profiler.recordInvoke('regex-batch-partial', (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+                    profiler?.recordInvoke?.('regex-batch-partial', (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
                     return merged;
                 }, (error) => {
                     throw error;
@@ -1108,7 +1135,7 @@ export function profileInvokeBroker(profiler, abiLike = globalThis.__TAURITAVERN
             }
 
             returned.finally(() => {
-                profiler.recordInvoke(String(command), (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+                profiler?.recordInvoke?.(String(command), (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
             }).catch(() => {
                 // Only silences the timing chain, not the caller's promise.
             });
@@ -1285,21 +1312,6 @@ function installProbeButton(profiler) {
 }
 
 /**
- * Idempotently (re)asserts every instrumentation patch. The host and other
- * extensions replace global bindings during startup, and on mobile the Tauri
- * ABI (`__TAURI__`, `__TAURITAVERN__`) may be injected after this module runs,
- * so the watchdog re-runs this on every tick. Each install checks its own
- * marker and is a no-op when already in place.
- */
-function reassertInstrumentation(profiler) {
-    profileFetch(profiler);
-    profileTauriInvoke(profiler);
-    profileInvokeBroker(profiler);
-    profileIndexedDb(profiler);
-    profileWaits(profiler);
-}
-
-/**
  * Persists the native-regex batch cache in localStorage so repeat assemblies
  * stay fast across page reloads (otherwise the first Rust batch after every
  * app start costs 30-60s again). The key is versioned and every cache entry
@@ -1355,31 +1367,74 @@ function installRegexCachePersistence(cache) {
     }
 }
 
+/**
+ * Re-asserts instrumentation patches. When the profiler is off (default),
+ * only the invoke-broker wrapper needed for the regex-batch cache is kept;
+ * the fetch/invoke/IndexedDB/timer meters are diagnostic-only overhead.
+ * @param {ReturnType<typeof createProfiler> | null} profiler
+ */
+function reassertInstrumentation(profiler) {
+    if (profiler) {
+        profileFetch(profiler);
+        profileTauriInvoke(profiler);
+        profileIndexedDb(profiler);
+        profileWaits(profiler);
+    }
+    // The broker wrapper memoizes native-regex batches; timing is optional.
+    profileInvokeBroker(profiler);
+}
+
 if (typeof globalThis.jQuery !== 'undefined') {
+    const profileEnabled = isProfileEnabled();
+
     installFrontendTokenizer(globalThis.jQuery);
-    const guard = activateFrontendTokenizerGuard(() => globalThis.jQuery, { notify: showNotification });
-    const profiler = createProfiler({
-        notify: (message) => showNotification(message, 30_000),
-        backendCountDelta: () => guard.backendCountDelta(),
+    // Capture after install: installFrontendTokenizer rebuilds the global
+    // state object (spread + stats).
+    const runtime = globalThis.__TT_FRONTEND_TOKENIZER__;
+    // Notifications are opt-in (see isNotificationEnabled); the watchdog keeps
+    // recovering silently otherwise.
+    const guard = activateFrontendTokenizerGuard(() => globalThis.jQuery, {
+        notify: (message) => {
+            if (isNotificationEnabled()) {
+                showNotification(message);
+            }
+        },
     });
-    activeProfiler = profiler;
-    globalThis.__TT_FRONTEND_TOKENIZER__.profile = () => profiler.snapshot();
-    observeLongTasks(profiler);
-    // Attach persistence before instrumentation wraps setTimeout, so the
+
+    let profiler = null;
+    if (profileEnabled) {
+        profiler = createProfiler({
+            notify: (message) => {
+                if (isNotificationEnabled()) {
+                    showNotification(message, 30_000);
+                }
+            },
+            backendCountDelta: () => guard.backendCountDelta(),
+        });
+        activeProfiler = profiler;
+        runtime.profile = () => profiler.snapshot();
+        observeLongTasks(profiler);
+        installProbeButton(profiler);
+    }
+
+    // Persistence must attach before instrumentation wraps setTimeout so the
     // debounced flush uses the native timer and stays out of the profiler.
     const regexPersistence = installRegexCachePersistence(REGEX_BATCH_CACHE);
-    globalThis.__TT_FRONTEND_TOKENIZER__.clearRegexCache = () => {
+    runtime.clearRegexCache = () => {
         REGEX_BATCH_CACHE.clear();
         regexPersistence?.clear();
     };
+
     reassertInstrumentation(profiler);
-    installProbeButton(profiler);
-    // Fast tick: re-assert the interceptor quickly when displaced, keep every
-    // instrumentation patch outermost, and drive the profiler window checks.
+
+    // Fast tick: re-assert the interceptor quickly when displaced, keep the
+    // broker cache wrapper outermost, and drive profiler checks when enabled.
     const guardTimer = setInterval(() => {
         guard.tick();
         reassertInstrumentation(profiler);
-        profiler.tick();
+        if (profiler) {
+            profiler.tick();
+        }
     }, PROFILE_TICK_MS);
     // Do not keep Node test contexts alive on account of the watchdog.
     guardTimer?.unref?.();
