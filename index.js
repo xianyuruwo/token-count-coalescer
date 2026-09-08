@@ -26,13 +26,26 @@
  * - empty-array requests (tokenizer warm-up), non-POST requests, and bodies
  *   that do not parse as an array
  *
- * Toggle at runtime with `__TT_FRONTEND_TOKENIZER__.enabled = false`
- * (then reload) to compare estimates against real counts.
+ * The host bootstrap also patches `jQuery.ajax` (and re-applies its patch
+ * after backend readiness, explicitly to undo third-party replacements), so
+ * this extension installs a watchdog that re-asserts its interceptor whenever
+ * it gets displaced, plus a one-shot diagnostic notification that reports
+ * whether counting is really being answered locally:
+ *   - "拦截生效"     -> estimates served locally, backend saw zero counts
+ *   - "部分生效"     -> both local estimates and backend counts happened
+ *   - "拦截未生效"   -> all counting still reaches the backend
+ *
+ * Runtime controls (desktop console):
+ *   __TT_FRONTEND_TOKENIZER__.enabled = false  // disable, then reload
+ *   __TT_FRONTEND_TOKENIZER__.stats             // { intercepted, passedThrough, reasserted, ... }
  */
 
 const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
 const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
 const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
+const EXTENSION_VERSION = '2.2.0';
+/** Invoke-broker commands whose counters reveal backend-side token counting. */
+const BACKEND_COUNT_COMMANDS = ['count_openai_tokens', 'count_openai_tokens_batch'];
 
 /** Character-level token estimate, identical to the host's fallback heuristic. */
 function estimateTextTokens(text) {
@@ -91,6 +104,33 @@ function estimateMessageRequest(messages) {
 }
 
 /**
+ * Best-effort user-visible notification.
+ * @param {string} message
+ */
+function showNotification(message) {
+    try {
+        const toastr = globalThis.toastr;
+        if (toastr && typeof toastr.info === 'function') {
+            toastr.info(message, 'Frontend Token Estimator', { timeOut: 10_000 });
+        }
+    } catch {
+        // Best-effort only.
+    }
+}
+
+/** Announces activation once per page load. */
+function announceInstall() {
+    const state = globalThis.__TT_FRONTEND_TOKENIZER__;
+    if (state?.announced) {
+        return;
+    }
+    if (state) {
+        state.announced = true;
+    }
+    showNotification(`前端 Token 估算已启用（v${EXTENSION_VERSION}）`);
+}
+
+/**
  * Installs the interceptor on a jQuery-like object.
  * Exposed for testability; the extension auto-installs on the page's jQuery.
  * @param {{ ajax: Function, Deferred?: Function }} jQueryLike
@@ -111,8 +151,8 @@ export function installFrontendTokenizer(jQueryLike) {
     // Read at call time so the toggle can be flipped after installation.
     const isEnabled = () => globalThis.__TT_FRONTEND_TOKENIZER__?.enabled !== false;
 
-    // Runtime stats for quick verification (see README):
-    // __TT_FRONTEND_TOKENIZER__.stats -> { intercepted, passedThrough, disabledAt }
+    // Runtime stats for quick verification (see module docs):
+    // { intercepted, passedThrough, installedAt, reasserted? }
     const stats = globalThis.__TT_FRONTEND_TOKENIZER__?.stats ?? {
         intercepted: 0,
         passedThrough: 0,
@@ -203,19 +243,119 @@ export function installFrontendTokenizer(jQueryLike) {
 }
 
 /**
- * User-visible confirmation so success is observable without dev tools.
+ * Sums the invoke-broker transport counters for backend token-count commands.
+ * @returns {number|null} Total transportInvokes, or null when unavailable.
  */
-function announceInstall() {
+function readBrokerCountTotals() {
+    let stats = null;
     try {
-        const toastr = globalThis.toastr;
-        if (toastr && typeof toastr.info === 'function') {
-            toastr.info('前端 Token 估算已启用（v2.1.0）', 'Frontend Token Estimator', { timeOut: 8000 });
-        }
+        stats = globalThis.__TAURITAVERN__?.invoke?.broker?.getStats?.();
     } catch {
-        // Notifications are best-effort only.
+        return null;
     }
+    if (!stats || typeof stats !== 'object') {
+        return null;
+    }
+
+    let total = 0;
+    for (const command of BACKEND_COUNT_COMMANDS) {
+        const entry = stats[command];
+        if (entry && typeof entry.transportInvokes === 'number') {
+            total += entry.transportInvokes;
+        }
+    }
+    return total;
+}
+
+/**
+ * Watchdog that keeps the interceptor as the outermost jQuery.ajax patch
+ * (the host re-applies its own patch after backend readiness, which would
+ * otherwise bury ours) and reports once whether counting is actually being
+ * answered locally, by cross-checking the invoke-broker counters.
+ *
+ * @param {() => any} getJQuery Accessor for the current jQuery-like object.
+ * @param {{ notify?: (message: string) => void, threshold?: number }} [options]
+ * @returns {{ tick: () => void, backendCountDelta: () => number }}
+ */
+export function activateFrontendTokenizerGuard(getJQuery, { notify = () => {}, threshold = 20 } = {}) {
+    if (typeof getJQuery !== 'function') {
+        throw new TypeError('activateFrontendTokenizerGuard requires a getJQuery function');
+    }
+
+    const baselineTotals = readBrokerCountTotals();
+    let burstNotified = false;
+    let displacementNotified = false;
+
+    const backendCountDelta = () => {
+        const totals = readBrokerCountTotals();
+        if (totals === null || baselineTotals === null) {
+            return 0;
+        }
+        return Math.max(0, totals - baselineTotals);
+    };
+
+    const getStats = () => globalThis.__TT_FRONTEND_TOKENIZER__?.stats
+        ?? { intercepted: 0, passedThrough: 0 };
+
+    /**
+     * @param {number} intercepted
+     * @param {number} backendDelta
+     * @param {number} reasserted
+     * @returns {string}
+     */
+    function burstMessage(intercepted, backendDelta, reasserted) {
+        let message;
+        if (intercepted === 0 && backendDelta > 0) {
+            message = `拦截未生效：后端已计数 ${backendDelta} 次，本地估算 0 次`;
+        } else if (backendDelta === 0) {
+            message = `拦截生效：已本地估算 ${intercepted} 次，后端计数 0 次`;
+        } else {
+            message = `部分生效：本地估算 ${intercepted} 次，后端仍在计数 ${backendDelta} 次`;
+        }
+        if (reasserted > 0) {
+            message += `（补丁被覆盖后已自动恢复 ${reasserted} 次）`;
+        }
+        return message;
+    }
+
+    function tick() {
+        const jQueryLike = getJQuery();
+        if (!jQueryLike || typeof jQueryLike.ajax !== 'function') {
+            return;
+        }
+
+        // Re-assert the interceptor if anything replaced it (host re-patch,
+        // other extensions, page scripts).
+        if (jQueryLike.ajax.__ttFrontendTokenizer !== true) {
+            installFrontendTokenizer(jQueryLike);
+            const stats = getStats();
+            stats.reasserted = (stats.reasserted || 0) + 1;
+            console.warn('[Frontend Tokenizer] jQuery.ajax patch was displaced; re-asserted');
+            if (!displacementNotified) {
+                displacementNotified = true;
+                notify('检测到 jQuery.ajax 补丁被覆盖，已自动恢复拦截');
+            }
+        }
+
+        // One-shot diagnostic once a generation-scale burst of counting happened.
+        if (!burstNotified) {
+            const stats = getStats();
+            const intercepted = stats.intercepted || 0;
+            const backendDelta = backendCountDelta();
+            if (intercepted >= threshold || backendDelta >= threshold) {
+                burstNotified = true;
+                notify(burstMessage(intercepted, backendDelta, stats.reasserted || 0));
+            }
+        }
+    }
+
+    return { tick, backendCountDelta };
 }
 
 if (typeof globalThis.jQuery !== 'undefined') {
     installFrontendTokenizer(globalThis.jQuery);
+    const guard = activateFrontendTokenizerGuard(() => globalThis.jQuery, { notify: showNotification });
+    const guardTimer = setInterval(() => guard.tick(), 1500);
+    // Do not keep Node test contexts alive on account of the watchdog.
+    guardTimer?.unref?.();
 }

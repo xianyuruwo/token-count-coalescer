@@ -35,12 +35,16 @@ Chat Completion 的提示词组装按"每条消息一次请求"计数 token：`M
 
 ## 验证是否生效
 
-1. **启动通知**：v2.1.0 起加载成功时会弹 toast「前端 Token 估算已启用（v2.1.0）」——无开发者工具也能确认
-2. **速度**：切换到另一个模型（使 token 缓存失效）后在长聊天中生成，组装应从 ~20 秒变为即时
-3. **数值**：启用/禁用扩展（刷新后）对比顶栏上下文 token 总数，估算值与精确值不同（中文内容明显偏高）
-4. **运行时统计**（桌面端 F12 控制台）：
+1. **启动通知**：加载成功时弹 toast「前端 Token 估算已启用（v2.2.0）」
+2. **看门狗**：宿主启动时会把自家 ajax 补丁重新套在最外层（见 `initialize-tauri-integration.js`），可能盖住本扩展的拦截。v2.2.0 内置看门狗：补丁被覆盖时自动恢复并弹 toast「检测到 jQuery.ajax 补丁被覆盖，已自动恢复拦截」
+3. **诊断 toast**（关键判据）：首次大量计数发生后弹一次性 toast，三种结果：
+   - 「拦截生效：已本地估算 N 次，后端计数 0 次」→ 正常工作
+   - 「部分生效：本地估算 N 次，后端仍在计数 M 次」→ 部分绕过
+   - 「拦截未生效：后端已计数 M 次，本地估算 0 次」→ 完全绕过
+4. **速度**：切换到另一个模型再切回（使 token 缓存失效）后在长聊天中生成
+5. **运行时统计**（桌面端 F12 控制台）：
    ```js
-   __TT_FRONTEND_TOKENIZER__.stats   // { intercepted, passedThrough, ... }
+   __TT_FRONTEND_TOKENIZER__.stats   // { intercepted, passedThrough, reasserted, ... }
    __TT_FRONTEND_TOKENIZER__.enabled = false  // 临时关闭对比，刷新后生效
    ```
 
