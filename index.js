@@ -1,223 +1,152 @@
 /**
- * Token Count Batch Coalescer
+ * Frontend Token Count Estimator for TauriTavern
  *
- * The chat-completion prompt assembly counts tokens one message at a time:
- * every `Message.createAsync` / `setName` call issues its own POST to
- * `/api/tokenizers/openai/count-batch`, which the host executes through a
- * serialized Tauri invoke. On long chats this means hundreds of sequential
- * IPC round trips (and a second full pass when names are sent as completions).
+ * Inspired by ST-Frontend-Tokenizer (https://github.com/GoldenglowMeow/ST-Frontend-Tokenizer, MIT).
  *
- * This extension patches `jQuery.ajax` at runtime and merges every burst of
- * tokenizer requests (same model, arriving within a short coalescing window)
- * into ONE batched request, deduplicating messages already counted in this
- * session. Results are mapped back per caller, so the tokenizer module sees
- * exactly the responses it expects. No source files are modified.
+ * Chat-completion prompt assembly counts tokens one message at a time through
+ * `/api/tokenizers/openai/count-batch`, executed by the host as serialized
+ * Tauri invokes. On long chats this means hundreds of sequential IPC round
+ * trips. This extension intercepts the OpenAI token-count endpoints and
+ * answers them locally with an estimate, so counting becomes instant and no
+ * request ever leaves the page.
  *
- * Deliberate pass-throughs (original behavior preserved):
- * - synchronous requests (`async: false`, used by the deprecated sync path)
- * - empty-array requests (tokenizer warm-up must reach the backend)
- * - legacy `/count` calls carrying more than one message (their response is a
- *   single total, not per-message counts)
- * - any request whose body cannot be parsed, and all non-tokenizer requests
+ * The estimate mirrors the backend contract
+ * (`MiktikTokenizerRepository::count_openai_messages`, non-legacy path):
+ *     3 tokens per message + 3 reply-priming tokens per request
+ *     + the tokenized text of every message field + 1 token for a name field
+ * with the tokenizer replaced by the same character-based heuristic the host
+ * itself uses as a fallback (`token-count-broker.js`): CJK chars count as one
+ * token each, everything else as 1/4 token.
+ *
+ * Deliberate pass-throughs (original request reaches the backend):
+ * - `/api/tokenizers/openai/count-prefix-batch`: World Info path, already a
+ *   single-flight batched request, and budget trimming depends on its accuracy
+ * - `/api/tokenizers/{name}/encode` and `/decode` endpoints: features like
+ *   logit bias need real token ids, which a character heuristic cannot produce
+ * - empty-array requests (tokenizer warm-up), non-POST requests, and bodies
+ *   that do not parse as an array
+ *
+ * Toggle at runtime with `__TT_FRONTEND_TOKENIZER__.enabled = false`
+ * (then reload) to compare estimates against real counts.
  */
 
+const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
 const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
-const LEGACY_ENDPOINT = '/api/tokenizers/openai/count';
-// A burst of per-message counts (e.g. Promise.all over a 12-message chunk)
-// fires within one microtask cascade, so a macrotask timer reliably captures
-// the whole burst while adding imperceptible latency.
-const FLUSH_DELAY_MS = 10;
-const SESSION_CACHE_LIMIT = 10_000;
-// After a failed coalesced request, stop intercepting for a while so callers
-// fall back to their own legacy/guesstimate handling instead of hammering a
-// dead endpoint through repeated coalesced retries.
-const FAILURE_BYPASS_MS = 5_000;
+const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
+
+/** Character-level token estimate, identical to the host's fallback heuristic. */
+function estimateTextTokens(text) {
+    const str = typeof text === 'string' ? text : String(text ?? '');
+    if (!str) {
+        return 0;
+    }
+    const cjkMatches = str.match(CJK_REGEX);
+    const cjk = cjkMatches ? cjkMatches.length : 0;
+    const other = str.length - cjk;
+    return Math.max(0, Math.ceil(cjk + other / 4));
+}
+
+/** Mirrors the backend's `value_to_text`: strings stay, anything else is JSON. */
+function valueToText(value) {
+    if (typeof value === 'string') {
+        return value;
+    }
+    if (value === undefined || value === null) {
+        return '';
+    }
+    return JSON.stringify(value) ?? '';
+}
 
 /**
- * Installs the ajax interceptor on a jQuery-like object.
+ * Token overhead of one message's fields, excluding the per-message wrapper.
+ * @param {any} message
+ * @returns {number}
+ */
+function estimateMessageFields(message) {
+    if (message && typeof message === 'object' && !Array.isArray(message)) {
+        let total = 0;
+        for (const [key, value] of Object.entries(message)) {
+            total += estimateTextTokens(valueToText(value));
+            if (key === 'name') {
+                total += 1;
+            }
+        }
+        return total;
+    }
+    return estimateTextTokens(valueToText(message));
+}
+
+/**
+ * Estimated count for one counting request over the given messages
+ * (3 per message + fields + 3 reply priming).
+ * @param {any[]} messages
+ * @returns {number}
+ */
+function estimateMessageRequest(messages) {
+    let total = 3;
+    for (const message of messages) {
+        total += 3 + estimateMessageFields(message);
+    }
+    return total;
+}
+
+/**
+ * Installs the interceptor on a jQuery-like object.
  * Exposed for testability; the extension auto-installs on the page's jQuery.
  * @param {{ ajax: Function, Deferred?: Function }} jQueryLike
- * @param {{ makeDeferred?: () => { resolve: Function, reject: Function, promise: () => any },
- *           schedule?: (fn: () => void, ms: number) => any,
- *           now?: () => number }} [options]
  * @returns {boolean} True if the interceptor was (or already had been) installed.
  */
-export function installTokenCountCoalescer(jQueryLike, options = {}) {
+export function installFrontendTokenizer(jQueryLike) {
     if (!jQueryLike || typeof jQueryLike.ajax !== 'function') {
-        console.warn('Token Count Coalescer: jQuery-like object with an ajax function is required');
+        console.warn('[Frontend Tokenizer] jQuery-like object with an ajax function is required');
         return false;
     }
 
-    if (jQueryLike.ajax.__ttTokenCountCoalescer) {
+    if (jQueryLike.ajax.__ttFrontendTokenizer) {
         return true;
     }
 
     const originalAjax = jQueryLike.ajax;
-    const makeDeferred = options.makeDeferred ?? (() => jQueryLike.Deferred());
-    const schedule = options.schedule ?? ((fn, ms) => setTimeout(fn, ms));
-    const now = options.now ?? (() => Date.now());
 
-    /** Session-scoped cache: `${model}\u0000${messageJson}` -> token count */
-    const sessionCache = new Map();
-    let bypassUntil = 0;
-    /** model -> { entries: [{messages, legacy, deferred}], timer } */
-    const pendingByModel = new Map();
-
-    const cacheKey = (model, messageJson) => `${model}\u0000${messageJson}`;
-
-    function rememberSessionCount(key, count) {
-        if (sessionCache.size >= SESSION_CACHE_LIMIT) {
-            // Map preserves insertion order; drop the oldest entry.
-            sessionCache.delete(sessionCache.keys().next().value);
-        }
-        sessionCache.set(key, count);
-    }
-
-    function extractModel(url) {
-        const queryIndex = url.indexOf('?');
-        const params = new URLSearchParams(queryIndex >= 0 ? url.slice(queryIndex + 1) : '');
-        return params.get('model') ?? '';
-    }
-
-    function flush(model) {
-        const state = pendingByModel.get(model);
-        pendingByModel.delete(model);
-        if (!state) {
-            return;
-        }
-
-        const entries = state.entries;
-        const misses = [];
-        const missIndexByJson = new Map();
-
-        for (const entry of entries) {
-            for (const message of entry.messages) {
-                const messageJson = JSON.stringify(message);
-                if (sessionCache.has(cacheKey(model, messageJson))) {
-                    continue;
-                }
-                if (!missIndexByJson.has(messageJson)) {
-                    missIndexByJson.set(messageJson, misses.length);
-                    misses.push(message);
-                }
-            }
-        }
-
-        const resolveEntries = (countsByJson) => {
-            for (const entry of entries) {
-                const counts = entry.messages.map((message) => {
-                    const messageJson = JSON.stringify(message);
-                    const cached = sessionCache.get(cacheKey(model, messageJson));
-                    if (cached !== undefined) {
-                        return cached;
-                    }
-                    return countsByJson.get(messageJson);
-                });
-                if (entry.legacy) {
-                    entry.deferred.resolve({ token_count: counts[0] });
-                } else {
-                    entry.deferred.resolve({ token_counts: counts });
-                }
-            }
-        };
-
-        if (misses.length === 0) {
-            resolveEntries(new Map());
-            return;
-        }
-
-        originalAjax.call(jQueryLike, {
-            async: true,
-            type: 'POST',
-            url: `${BATCH_ENDPOINT}?model=${encodeURIComponent(model)}`,
-            data: JSON.stringify(misses),
-            dataType: 'json',
-            contentType: 'application/json',
-        }).then(
-            (data) => {
-                const tokenCounts = Array.isArray(data?.token_counts) ? data.token_counts : null;
-                if (!tokenCounts || tokenCounts.length !== misses.length) {
-                    for (const entry of entries) {
-                        entry.deferred.reject(new Error('Token Count Coalescer: unexpected batch response shape'));
-                    }
-                    return;
-                }
-                const countsByJson = new Map();
-                missIndexByJson.forEach((index, messageJson) => {
-                    const count = Number(tokenCounts[index]);
-                    if (Number.isFinite(count)) {
-                        countsByJson.set(messageJson, count);
-                        rememberSessionCount(cacheKey(model, messageJson), count);
-                    }
-                });
-                resolveEntries(countsByJson);
-            },
-            (error) => {
-                bypassUntil = now() + FAILURE_BYPASS_MS;
-                for (const entry of entries) {
-                    entry.deferred.reject(error);
-                }
-            },
-        );
-    }
+    // Read at call time so the toggle can be flipped after installation.
+    const isEnabled = () => globalThis.__TT_FRONTEND_TOKENIZER__?.enabled !== false;
 
     /**
-     * @returns {any} A thenable to return from the patched ajax, or null when
-     * the call must be passed through untouched.
+     * @returns {object|null} Mock response data, or null when the call must
+     * be passed through to the real backend.
      */
     function tryIntercept(settings) {
-        // Compare the exact path so sibling endpoints such as
-        // `/count-prefix-batch` never match the legacy `/count` prefix.
-        const url = String(settings.url || '');
-        const path = url.split('?')[0].split('#')[0];
-        let legacy = false;
+        // Exact-path matching so sibling endpoints (count-prefix-batch) never match.
+        const path = String(settings.url || '').split('?')[0].split('#')[0];
+        let batch = false;
         if (path === BATCH_ENDPOINT) {
-            legacy = false;
-        } else if (path === LEGACY_ENDPOINT) {
-            legacy = true;
+            batch = true;
+        } else if (path === COUNT_ENDPOINT) {
+            batch = false;
         } else {
             return null;
         }
 
-        if (String(settings.type || '').toUpperCase() !== 'POST') {
-            return null;
-        }
-        // The deprecated synchronous counting path depends on the request
-        // completing before $.ajax returns; never defer those calls.
-        if (settings.async === false) {
+        const method = String(settings.type || settings.method || 'GET').toUpperCase();
+        if (method !== 'POST') {
             return null;
         }
 
-        let messages = null;
+        let body = null;
         try {
-            messages = JSON.parse(settings.data);
+            body = JSON.parse(settings.data);
         } catch {
             return null;
         }
         // Empty arrays are tokenizer warm-ups that must reach the backend.
-        if (!Array.isArray(messages) || messages.length === 0) {
-            return null;
-        }
-        // Only single-message legacy calls have per-message batch semantics.
-        if (legacy && messages.length !== 1) {
+        if (!Array.isArray(body) || body.length === 0) {
             return null;
         }
 
-        const model = extractModel(url);
-        const deferred = makeDeferred();
-        let state = pendingByModel.get(model);
-        if (!state) {
-            state = { entries: [], timer: null };
-            pendingByModel.set(model, state);
+        if (batch) {
+            return { token_counts: body.map((message) => estimateMessageRequest([message])) };
         }
-        state.entries.push({ messages, legacy, deferred });
-        if (state.timer === null) {
-            state.timer = schedule(() => {
-                state.timer = null;
-                flush(model);
-            }, FLUSH_DELAY_MS);
-        }
-        return deferred.promise();
+        return { token_count: estimateMessageRequest(body) };
     }
 
     const patchedAjax = function (urlOrSettings, maybeSettings) {
@@ -225,24 +154,39 @@ export function installTokenCountCoalescer(jQueryLike, options = {}) {
         if (typeof urlOrSettings === 'string' && maybeSettings && typeof maybeSettings === 'object') {
             settings = { ...maybeSettings, url: urlOrSettings };
         }
-        if (settings && typeof settings === 'object' && now() >= bypassUntil) {
+
+        if (settings && typeof settings === 'object' && isEnabled()) {
+            let responseData = null;
             try {
-                const promise = tryIntercept(settings);
-                if (promise) {
-                    return promise;
-                }
+                responseData = tryIntercept(settings);
             } catch (error) {
-                console.warn('Token Count Coalescer: interception failed, passing request through', error);
+                console.warn('[Frontend Tokenizer] interception failed, passing request through', error);
+            }
+
+            if (responseData) {
+                if (typeof settings.success === 'function') {
+                    // Synchronous invocation also satisfies the deprecated
+                    // async:false call sites that read closure variables
+                    // immediately after jQuery.ajax returns.
+                    settings.success(responseData);
+                }
+                if (typeof jQueryLike.Deferred === 'function') {
+                    const deferred = jQueryLike.Deferred();
+                    deferred.resolve(responseData);
+                    return deferred.promise();
+                }
+                return Promise.resolve(responseData);
             }
         }
+
         return originalAjax.apply(this, arguments);
     };
-    patchedAjax.__ttTokenCountCoalescer = true;
+    patchedAjax.__ttFrontendTokenizer = true;
     jQueryLike.ajax = patchedAjax;
-    console.debug('Token Count Coalescer: ajax interceptor installed');
+    console.log('[Frontend Tokenizer] Patched jQuery.ajax; token counting is now estimated locally');
     return true;
 }
 
 if (typeof globalThis.jQuery !== 'undefined') {
-    installTokenCountCoalescer(globalThis.jQuery);
+    installFrontendTokenizer(globalThis.jQuery);
 }

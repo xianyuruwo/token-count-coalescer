@@ -1,10 +1,10 @@
 {
-    "display_name": "Token Count Batch Coalescer",
+    "display_name": "Frontend Token Estimator",
     "loading_order": 100,
     "requires": [],
     "optional": [],
     "js": "index.js",
-    "author": "TauriTavern Local",
-    "version": "1.0.0",
-    "homePage": ""
+    "author": "xianyuruwo",
+    "version": "2.0.0",
+    "homePage": "https://github.com/xianyuruwo/token-count-coalescer"
 }
