@@ -1,10 +1,10 @@
 {
-    "display_name": "Frontend Token Estimator",
+    "display_name": "Rust Regex Batch Cache",
     "loading_order": 100,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "author": "xianyuruwo",
-    "version": "3.6.0",
+    "version": "4.0.0",
     "homePage": "https://github.com/xianyuruwo/token-count-coalescer"
 }

@@ -1,770 +1,43 @@
 ﻿/**
- * Frontend Token Count Estimator for TauriTavern
+ * Native Regex Batch Cache for TauriTavern (v4.0.0)
  *
- * Inspired by ST-Frontend-Tokenizer (https://github.com/GoldenglowMeow/ST-Frontend-Tokenizer, MIT).
+ * A pure, silent fix for the Rust Regex Backend's worst property: every
+ * prompt assembly re-runs the whole regex batch over the chat, even when the
+ * message texts and the (depth-filtered) script sets are unchanged. On long
+ * chats with many scripts the `regress` engine takes tens of seconds per
+ * batch, and repeats cost the same every time because upstream only caches
+ * compiled patterns, never results.
  *
- * Chat-completion prompt assembly counts tokens one message at a time through
- * `/api/tokenizers/openai/count-batch`, executed by the host as serialized
- * Tauri invokes. On long chats this means hundreds of sequential IPC round
- * trips. This extension intercepts the OpenAI token-count endpoints and
- * answers them locally with an estimate, so counting becomes instant and no
- * request ever leaves the page.
+ * `apply_native_regex_batch` output is a pure function of each task's text and
+ * script list: identical input always yields identical output. This extension
+ * memoizes completed batches at the host ABI invoke-broker boundary
+ * (`__TAURITAVERN__.invoke.broker.invoke`, the single choke point every
+ * `safeInvoke` resolves dynamically):
  *
- * The estimate mirrors the backend contract
- * (`MiktikTokenizerRepository::count_openai_messages`, non-legacy path):
- *     3 tokens per message + 3 reply-priming tokens per request
- *     + the tokenized text of every message field + 1 token for a name field
- * with the tokenizer replaced by the same character-based heuristic the host
- * itself uses as a fallback (`token-count-broker.js`): CJK chars count as one
- * token each, everything else as 1/4 token.
+ *   - fully cached batch  -> answered locally, no Rust round trip
+ *   - partially cached    -> only the missing tasks go to Rust, results are
+ *                             merged back in the original task order
+ *   - otherwise           -> normal Rust call; the outputs are memoized for
+ *                             the next time
  *
- * Deliberate pass-throughs (original request reaches the backend):
- * - `/api/tokenizers/openai/count-prefix-batch`: World Info path, already a
- *   single-flight batched request, and budget trimming depends on its accuracy
- * - `/api/tokenizers/{name}/encode` and `/decode` endpoints: features like
- *   logit bias need real token ids, which a character heuristic cannot produce
- * - empty-array requests (tokenizer warm-up), non-POST requests, and bodies
- *   that do not parse as an array
+ * The cache is an LRU (16MB in memory) persisted to localStorage (4MB budget,
+ * versioned bucket), so repeat assemblies stay fast across app restarts. Keys
+ * embed the full task payload (message text + every script definition), so
+ * editing messages or regex scripts invalidates naturally and World Info
+ * activation is untouched: any change that could alter an output necessarily
+ * changes the key. Cached values are real Rust outputs, never estimates.
  *
- * The host bootstrap (and possibly sibling extensions) re-apply their own
- * `jQuery.ajax` patch after this extension loads, burying the interceptor.
- * A watchdog re-asserts it whenever displaced.
+ * Everything else was removed: no token-count estimation, no diagnostics, no
+ * notifications, no floating UI. Console introspection:
  *
- * Performance profiler (v3.0.0): because slow prompt assembly is not always
- * caused by token counting, the extension also measures where page time goes:
- *   - main-thread long tasks (PerformanceObserver) and timer drift
- *   - wall time of every ajax/fetch request passed through to the host
- * v3.1.0 closes the two remaining invisible async sinks:
- *   - Tauri invokes (`window.__TAURI__.core.invoke`): the native regex batch,
- *     chat saves, etc. bypass the fetch patch because the Tauri runtime holds
- *     its own transport; each invoke is now timed by command name
- *   - IndexedDB reads/writes (localforage token cache / settings buckets)
- * v3.2.0 closes the last ones:
- *   - the host ABI's invoke broker (`__TAURITAVERN__.invoke.broker.invoke`):
- *     patching `__TAURI__.core.invoke` can silently fail (the injected `core`
- *     object may expose getters) or be bypassed by early-bound references,
- *     while every `safeInvoke` in the app resolves `broker.invoke` dynamically
- *     on a plain writable object — wrapping it catches all routed traffic
- *   - long `setTimeout` delays and throttled `requestAnimationFrame` gaps,
- *     which are pure waiting time invisible to every other meter
- * After a busy period it pops a summary toast ("TT 性能剖析") stating whether
- * the time was spent blocking the main thread, waiting on HTTP requests,
- * waiting on Tauri invokes (with per-command totals), or in IndexedDB.
- * A small floating "Σ" button re-shows the report on demand
- * (double-tap hides it).
- *
- * Runtime controls (desktop console):
- *   __TT_FRONTEND_TOKENIZER__.enabled = false  // disable estimator, reload
- *   __TT_FRONTEND_TOKENIZER__.stats             // { intercepted, passedThrough, reasserted, ... }
- *   __TT_FRONTEND_TOKENIZER__.profile()         // profiler snapshot object
+ *   __TT_REGEX_CACHE__.stats        // { hits, partials }
+ *   __TT_REGEX_CACHE__.size()       // in-memory entry count
+ *   __TT_REGEX_CACHE__.clear()      // wipe memory + persisted bucket
  */
 
-const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
-const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
-const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
-const EXTENSION_VERSION = '3.6.0';
-
-/**
- * Diagnostics are off by default. Re-enable on demand (desktop console):
- *   localStorage.setItem('tt:fte:profile', '1'); location.reload();   // profiler + Σ button
- *   __TT_FRONTEND_TOKENIZER__.notify = true                            // toasts (live toggle)
- */
-function isProfileEnabled() {
-    try {
-        if (globalThis.localStorage?.getItem('tt:fte:profile') === '1') {
-            return true;
-        }
-    } catch {
-        // Ignore storage failures.
-    }
-    return false;
-}
-
-/** Read live so the flag can be toggled without a reload. */
-function isNotificationEnabled() {
-    if (globalThis.__TT_FRONTEND_TOKENIZER__?.notify === true) {
-        return true;
-    }
-    return false;
-}
-/** Invoke-broker commands whose counters reveal backend-side token counting. */
-const BACKEND_COUNT_COMMANDS = ['count_openai_tokens', 'count_openai_tokens_batch'];
-/** Profiler: report once a window accumulates this much busy time (ms). */
-const PROFILE_AUTO_THRESHOLD_MS = 2_000;
-/** Profiler: report only after activity has been quiet for this long (ms). */
-const PROFILE_QUIET_MS = 3_000;
-/** Profiler: minimum spacing between automatic reports (ms). */
-const PROFILE_MIN_INTERVAL_MS = 30_000;
-/** Profiler: watchdog tick interval (ms); also drives the drift meter. */
-const PROFILE_TICK_MS = 300;
-/** Profiler: timer lateness below this is treated as jitter, not blocking. */
-const PROFILE_DRIFT_MIN_MS = 100;
-
-/** @type {{ recordAjax: (path: string, ms: number) => void } | null} Set by page init. */
-let activeProfiler = null;
-
-/** Character-level token estimate, identical to the host's fallback heuristic. */
-function estimateTextTokens(text) {
-    const str = typeof text === 'string' ? text : String(text ?? '');
-    if (!str) {
-        return 0;
-    }
-    const cjkMatches = str.match(CJK_REGEX);
-    const cjk = cjkMatches ? cjkMatches.length : 0;
-    const other = str.length - cjk;
-    return Math.max(0, Math.ceil(cjk + other / 4));
-}
-
-/** Mirrors the backend's `value_to_text`: strings stay, anything else is JSON. */
-function valueToText(value) {
-    if (typeof value === 'string') {
-        return value;
-    }
-    if (value === undefined || value === null) {
-        return '';
-    }
-    return JSON.stringify(value) ?? '';
-}
-
-/**
- * Token overhead of one message's fields, excluding the per-message wrapper.
- * @param {any} message
- * @returns {number}
- */
-function estimateMessageFields(message) {
-    if (message && typeof message === 'object' && !Array.isArray(message)) {
-        let total = 0;
-        for (const [key, value] of Object.entries(message)) {
-            total += estimateTextTokens(valueToText(value));
-            if (key === 'name') {
-                total += 1;
-            }
-        }
-        return total;
-    }
-    return estimateTextTokens(valueToText(message));
-}
-
-/**
- * Estimated count for one counting request over the given messages
- * (3 per message + fields + 3 reply priming).
- * @param {any[]} messages
- * @returns {number}
- */
-function estimateMessageRequest(messages) {
-    let total = 3;
-    for (const message of messages) {
-        total += 3 + estimateMessageFields(message);
-    }
-    return total;
-}
-
-/** Request path without query/hash, for endpoint labels. */
-function requestPathOf(url) {
-    return String(url || '').split('?')[0].split('#')[0];
-}
-
-/**
- * Best-effort user-visible notification.
- * @param {string} message
- * @param {number} [timeOut]
- */
-function showNotification(message, timeOut = 10_000) {
-    try {
-        const toastr = globalThis.toastr;
-        if (toastr && typeof toastr.info === 'function') {
-            toastr.info(message, 'Frontend Token Estimator', { timeOut, escapeHtml: false });
-        }
-    } catch {
-        // Best-effort only.
-    }
-}
-
-/** Announces activation once per page load (silent unless notifications enabled). */
-function announceInstall() {
-    if (!isNotificationEnabled()) {
-        return;
-    }
-    const state = globalThis.__TT_FRONTEND_TOKENIZER__;
-    if (state?.announced) {
-        return;
-    }
-    if (state) {
-        state.announced = true;
-    }
-    showNotification(`前端 Token 估算已启用（v${EXTENSION_VERSION}）`);
-}
-
-/**
- * Installs the interceptor on a jQuery-like object.
- * Exposed for testability; the extension auto-installs on the page's jQuery.
- * @param {{ ajax: Function, Deferred?: Function }} jQueryLike
- * @returns {boolean} True if the interceptor was (or already had been) installed.
- */
-export function installFrontendTokenizer(jQueryLike) {
-    if (!jQueryLike || typeof jQueryLike.ajax !== 'function') {
-        console.warn('[Frontend Tokenizer] jQuery-like object with an ajax function is required');
-        return false;
-    }
-
-    if (jQueryLike.ajax.__ttFrontendTokenizer) {
-        return true;
-    }
-
-    const originalAjax = jQueryLike.ajax;
-
-    // Read at call time so the toggle can be flipped after installation.
-    const isEnabled = () => globalThis.__TT_FRONTEND_TOKENIZER__?.enabled !== false;
-
-    // Runtime stats for quick verification (see module docs):
-    // { intercepted, passedThrough, installedAt, reasserted? }
-    const stats = globalThis.__TT_FRONTEND_TOKENIZER__?.stats ?? {
-        intercepted: 0,
-        passedThrough: 0,
-        installedAt: new Date().toISOString(),
-    };
-    globalThis.__TT_FRONTEND_TOKENIZER__ = {
-        ...(globalThis.__TT_FRONTEND_TOKENIZER__ ?? {}),
-        stats,
-    };
-
-    /**
-     * @returns {object|null} Mock response data, or null when the call must
-     * be passed through to the real backend.
-     */
-    function tryIntercept(settings) {
-        // Exact-path matching so sibling endpoints (count-prefix-batch) never match.
-        const path = requestPathOf(settings.url);
-        let batch = false;
-        if (path === BATCH_ENDPOINT) {
-            batch = true;
-        } else if (path === COUNT_ENDPOINT) {
-            batch = false;
-        } else {
-            return null;
-        }
-
-        const method = String(settings.type || settings.method || 'GET').toUpperCase();
-        if (method !== 'POST') {
-            return null;
-        }
-
-        let body = null;
-        try {
-            body = JSON.parse(settings.data);
-        } catch {
-            return null;
-        }
-        // Empty arrays are tokenizer warm-ups that must reach the backend.
-        if (!Array.isArray(body) || body.length === 0) {
-            return null;
-        }
-
-        if (batch) {
-            return { token_counts: body.map((message) => estimateMessageRequest([message])) };
-        }
-        return { token_count: estimateMessageRequest(body) };
-    }
-
-    const patchedAjax = function (urlOrSettings, maybeSettings) {
-        let settings = urlOrSettings;
-        if (typeof urlOrSettings === 'string' && maybeSettings && typeof maybeSettings === 'object') {
-            settings = { ...maybeSettings, url: urlOrSettings };
-        }
-
-        if (settings && typeof settings === 'object' && isEnabled()) {
-            let responseData = null;
-            try {
-                responseData = tryIntercept(settings);
-            } catch (error) {
-                console.warn('[Frontend Tokenizer] interception failed, passing request through', error);
-            }
-
-            if (responseData) {
-                stats.intercepted += 1;
-                if (typeof settings.success === 'function') {
-                    // Synchronous invocation also satisfies the deprecated
-                    // async:false call sites that read closure variables
-                    // immediately after jQuery.ajax returns.
-                    settings.success(responseData);
-                }
-                if (typeof jQueryLike.Deferred === 'function') {
-                    const deferred = jQueryLike.Deferred();
-                    deferred.resolve(responseData);
-                    return deferred.promise();
-                }
-                return Promise.resolve(responseData);
-            }
-        }
-
-        stats.passedThrough += 1;
-        const path = requestPathOf(settings?.url);
-        const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
-        const elapsed = () => Math.max(0, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
-        let result;
-        try {
-            result = originalAjax.apply(this, arguments);
-        } catch (error) {
-            activeProfiler?.recordAjax(path, elapsed());
-            throw error;
-        }
-        if (activeProfiler) {
-            try {
-                // jqXHR and promises settle later; measure until then. For
-                // sync (async:false) XHRs the deferred is already resolved,
-                // so the timing is equally accurate on the microtask.
-                Promise.resolve(result).finally(() => {
-                    activeProfiler?.recordAjax(path, elapsed());
-                }).catch(() => {
-                    // Only silences the timing chain, not the caller's promise.
-                });
-            } catch {
-                // Non-thenable result: record synchronously.
-                activeProfiler.recordAjax(path, elapsed());
-            }
-        }
-        return result;
-    };
-    patchedAjax.__ttFrontendTokenizer = true;
-    jQueryLike.ajax = patchedAjax;
-    console.log('[Frontend Tokenizer] Patched jQuery.ajax; token counting is now estimated locally');
-    announceInstall();
-    return true;
-}
-
-/**
- * Sums the invoke-broker transport counters for backend token-count commands.
- * @returns {number|null} Total transportInvokes, or null when unavailable.
- */
-function readBrokerCountTotals() {
-    let stats = null;
-    try {
-        stats = globalThis.__TAURITAVERN__?.invoke?.broker?.getStats?.();
-    } catch {
-        return null;
-    }
-    if (!stats || typeof stats !== 'object') {
-        return null;
-    }
-
-    let total = 0;
-    for (const command of BACKEND_COUNT_COMMANDS) {
-        const entry = stats[command];
-        if (entry && typeof entry.transportInvokes === 'number') {
-            total += entry.transportInvokes;
-        }
-    }
-    return total;
-}
-
-/**
- * Watchdog that keeps the interceptor as the outermost jQuery.ajax patch
- * (the host re-applies its own patch after backend readiness, which would
- * otherwise bury ours) and reports once whether counting is actually being
- * answered locally, by cross-checking the invoke-broker counters.
- *
- * @param {() => any} getJQuery Accessor for the current jQuery-like object.
- * @param {{ notify?: (message: string) => void, threshold?: number }} [options]
- * @returns {{ tick: () => void, backendCountDelta: () => number }}
- */
-export function activateFrontendTokenizerGuard(getJQuery, { notify = () => {}, threshold = 20 } = {}) {
-    if (typeof getJQuery !== 'function') {
-        throw new TypeError('activateFrontendTokenizerGuard requires a getJQuery function');
-    }
-
-    const baselineTotals = readBrokerCountTotals();
-    let burstNotified = false;
-    let displacementNotified = false;
-
-    const backendCountDelta = () => {
-        const totals = readBrokerCountTotals();
-        if (totals === null || baselineTotals === null) {
-            return 0;
-        }
-        return Math.max(0, totals - baselineTotals);
-    };
-
-    const getStats = () => globalThis.__TT_FRONTEND_TOKENIZER__?.stats
-        ?? { intercepted: 0, passedThrough: 0 };
-
-    /**
-     * @param {number} intercepted
-     * @param {number} backendDelta
-     * @param {number} reasserted
-     * @returns {string}
-     */
-    function burstMessage(intercepted, backendDelta, reasserted) {
-        let message;
-        if (intercepted === 0 && backendDelta > 0) {
-            message = `拦截未生效：后端已计数 ${backendDelta} 次，本地估算 0 次`;
-        } else if (backendDelta === 0) {
-            message = `拦截生效：已本地估算 ${intercepted} 次，后端计数 0 次`;
-        } else {
-            message = `部分生效：本地估算 ${intercepted} 次，后端仍在计数 ${backendDelta} 次`;
-        }
-        if (reasserted > 0) {
-            message += `（补丁被覆盖后已自动恢复 ${reasserted} 次）`;
-        }
-        return message;
-    }
-
-    function tick() {
-        const jQueryLike = getJQuery();
-        if (!jQueryLike || typeof jQueryLike.ajax !== 'function') {
-            return;
-        }
-
-        // Re-assert the interceptor if anything replaced it (host re-patch,
-        // other extensions, page scripts).
-        if (jQueryLike.ajax.__ttFrontendTokenizer !== true) {
-            // Log a snippet of the displacer to help identify who buried us.
-            try {
-                const displacer = String(jQueryLike.ajax).slice(0, 120).replace(/\s+/g, ' ');
-                console.warn('[Frontend Tokenizer] jQuery.ajax patch was displaced by:', displacer);
-            } catch {
-                console.warn('[Frontend Tokenizer] jQuery.ajax patch was displaced');
-            }
-            installFrontendTokenizer(jQueryLike);
-            const stats = getStats();
-            stats.reasserted = (stats.reasserted || 0) + 1;
-            if (!displacementNotified) {
-                displacementNotified = true;
-                notify('检测到 jQuery.ajax 补丁被覆盖，已自动恢复拦截');
-            }
-        }
-
-        // One-shot diagnostic once a generation-scale burst of counting happened.
-        if (!burstNotified) {
-            const stats = getStats();
-            const intercepted = stats.intercepted || 0;
-            const backendDelta = backendCountDelta();
-            if (intercepted >= threshold || backendDelta >= threshold) {
-                burstNotified = true;
-                notify(burstMessage(intercepted, backendDelta, stats.reasserted || 0));
-            }
-        }
-    }
-
-    return { tick, backendCountDelta };
-}
-
-/** @param {number} ms */
-function fmtSeconds(ms) {
-    return `${(ms / 1000).toFixed(1)}s`;
-}
-
-/**
- * Measures where page time goes during slow operations so the actual
- * bottleneck can be identified without dev tools.
- *
- * @param {{
- *   notify?: (message: string) => void,
- *   backendCountDelta?: () => number,
- *   now?: () => number,
- *   isHidden?: () => boolean,
- *   tickMs?: number,
- * }} [options]
- * @returns {{
- *   tick: () => void,
- *   recordAjax: (path: string, ms: number) => void,
- *   recordLongTask: (ms: number) => void,
- *   recordInvoke: (command: string, ms: number) => void,
- *   recordIdb: (op: string, ms: number) => void,
- *   snapshot: () => object,
- *   reportNow: () => string,
- * }}
- */
-export function createProfiler(options = {}) {
-    const notify = options.notify ?? (() => {});
-    const backendCountDelta = options.backendCountDelta ?? (() => 0);
-    const now = options.now ?? (() => (typeof performance !== 'undefined' ? performance.now() : Date.now()));
-    const isHidden = options.isHidden ?? (() => typeof document !== 'undefined' && document.hidden);
-    const tickMs = options.tickMs ?? PROFILE_TICK_MS;
-
-    let windowState = emptyWindow();
-    let lastTickAt = null;
-    let lastActivityAt = null;
-    let lastReportAt = -Infinity;
-    let lastSeenIntercepted = 0;
-    let lastSeenReasserted = 0;
-    let lastSeenRegexCacheHits = 0;
-
-    function emptyWindow() {
-        return {
-            startedAt: Date.now(),
-            longTaskMs: 0,
-            longTaskCount: 0,
-            maxLongTaskMs: 0,
-            driftMs: 0,
-            ajaxCount: 0,
-            ajaxMs: 0,
-            ajaxMaxMs: 0,
-            ajaxByPath: new Map(),
-            invokeCount: 0,
-            invokeMs: 0,
-            invokeByCommand: new Map(),
-            idbCount: 0,
-            idbMs: 0,
-            idbByOp: new Map(),
-            timerCount: 0,
-            timerMs: 0,
-            timerByDelay: new Map(),
-            rafCount: 0,
-            rafGapMs: 0,
-        };
-    }
-
-    function noteActivity() {
-        lastActivityAt = now();
-    }
-
-    /**
-     * @param {Map<string, {count: number, ms: number, maxMs: number}>} map
-     * @param {string} key
-     * @param {number} ms
-     */
-    function bumpEntry(map, key, ms) {
-        const entry = map.get(key) ?? { count: 0, ms: 0, maxMs: 0 };
-        entry.count += 1;
-        entry.ms += ms;
-        entry.maxMs = Math.max(entry.maxMs, ms);
-        map.set(key, entry);
-    }
-
-    /**
-     * @param {Map<string, {count: number, ms: number, maxMs: number}>} map
-     * @param {number} limit
-     * @returns {string} "cmd ×N (Xs, max Ys)" fragments joined by 、
-     */
-    function topEntries(map, limit) {
-        return [...map.entries()]
-            .sort((a, b) => b[1].ms - a[1].ms)
-            .slice(0, limit)
-            .map(([key, entry]) => `${key} ×${entry.count} (${fmtSeconds(entry.ms)}${entry.count > 1 ? `, 最长 ${fmtSeconds(entry.maxMs)}` : ''})`)
-            .join('、');
-    }
-
-    function recordAjax(path, ms) {
-        const w = windowState;
-        w.ajaxCount += 1;
-        w.ajaxMs += ms;
-        w.ajaxMaxMs = Math.max(w.ajaxMaxMs, ms);
-        bumpEntry(w.ajaxByPath, path, ms);
-        noteActivity();
-    }
-
-    function recordLongTask(ms) {
-        const w = windowState;
-        w.longTaskMs += ms;
-        w.longTaskCount += 1;
-        w.maxLongTaskMs = Math.max(w.maxLongTaskMs, ms);
-        noteActivity();
-    }
-
-    function recordInvoke(command, ms) {
-        const w = windowState;
-        w.invokeCount += 1;
-        w.invokeMs += ms;
-        bumpEntry(w.invokeByCommand, String(command || 'unknown'), ms);
-        noteActivity();
-    }
-
-    function recordIdb(op, ms) {
-        const w = windowState;
-        w.idbCount += 1;
-        w.idbMs += ms;
-        bumpEntry(w.idbByOp, String(op || 'idb'), ms);
-        noteActivity();
-    }
-
-    /**
-     * A scheduled timer finally fired after `ms` of requested delay.
-     * Pure waiting time (delays, backoff, polling) is invisible elsewhere.
-     * @param {number} scheduledMs
-     * @param {number} actualMs
-     */
-    function recordTimer(scheduledMs, actualMs) {
-        const w = windowState;
-        w.timerCount += 1;
-        w.timerMs += actualMs;
-        bumpEntry(w.timerByDelay, `${Math.round(scheduledMs)}ms`, actualMs);
-        noteActivity();
-    }
-
-    /** A requestAnimationFrame callback fired `gapMs` after scheduling. */
-    function recordRafGap(gapMs) {
-        const w = windowState;
-        w.rafCount += 1;
-        w.rafGapMs += gapMs;
-        noteActivity();
-    }
-
-    /**
-     * @param {ReturnType<typeof emptyWindow>} w
-     * @returns {string} Multi-line report using <br> for toastr.
-     */
-    function buildReport(w) {
-        const stats = globalThis.__TT_FRONTEND_TOKENIZER__?.stats
-            ?? { intercepted: 0, passedThrough: 0, reasserted: 0 };
-        const interceptedDelta = (stats.intercepted || 0) - lastSeenIntercepted;
-        const reassertedDelta = (stats.reasserted || 0) - lastSeenReasserted;
-        const regexCacheHitsDelta = (stats.regexCacheHits || 0) - lastSeenRegexCacheHits;
-        const elapsedMs = Date.now() - w.startedAt;
-        const busyMs = Math.max(w.longTaskMs, w.driftMs);
-
-        const lines = [
-            `TT 性能剖析（最近 ${(elapsedMs / 1000).toFixed(1)}s）：`,
-            `主线程繁忙 ${fmtSeconds(busyMs)}（长任务 ${fmtSeconds(w.longTaskMs)}/${w.longTaskCount} 次，最大 ${fmtSeconds(w.maxLongTaskMs)}；计时漂移 ${fmtSeconds(w.driftMs)}）`,
-            `HTTP 请求 ${w.ajaxCount} 次，共 ${fmtSeconds(w.ajaxMs)}（最慢单次 ${fmtSeconds(w.ajaxMaxMs)}）`,
-        ];
-        if (w.ajaxByPath.size > 0) {
-            lines.push(`最耗时请求：${topEntries(w.ajaxByPath, 3)}`);
-        }
-        lines.push(`Tauri 调用 ${w.invokeCount} 次，共 ${fmtSeconds(w.invokeMs)}`);
-        if (w.invokeByCommand.size > 0) {
-            lines.push(`最耗时调用：${topEntries(w.invokeByCommand, 4)}`);
-        }
-        if (w.idbCount > 0) {
-            lines.push(`IndexedDB ${w.idbCount} 次，共 ${fmtSeconds(w.idbMs)}${w.idbByOp.size > 0 ? `（${topEntries(w.idbByOp, 2)}）` : ''}`);
-        }
-        if (w.timerCount > 0) {
-            lines.push(`定时器等待 ${w.timerCount} 次，共 ${fmtSeconds(w.timerMs)}${w.timerByDelay.size > 0 ? `（${topEntries(w.timerByDelay, 4)}）` : ''}`);
-        }
-        if (w.rafCount > 0) {
-            lines.push(`rAF 延迟 ${w.rafCount} 次，共 ${fmtSeconds(w.rafGapMs)}`);
-        }
-        lines.push(`本地估算 ${interceptedDelta} 次｜补丁恢复 ${reassertedDelta} 次｜后端计数 ${backendCountDelta()} 次`);
-        if (regexCacheHitsDelta > 0) {
-            lines.push(`正则批处理缓存命中 ${regexCacheHitsDelta} 次（跳过 Rust 调用）`);
-        }
-        return lines.join('<br>');
-    }
-
-    function resetWindow() {
-        const stats = globalThis.__TT_FRONTEND_TOKENIZER__?.stats;
-        if (stats) {
-            lastSeenIntercepted = stats.intercepted || 0;
-            lastSeenReasserted = stats.reasserted || 0;
-            lastSeenRegexCacheHits = stats.regexCacheHits || 0;
-        }
-        windowState = emptyWindow();
-    }
-
-    function reportNow() {
-        const message = buildReport(windowState);
-        notify(message);
-        return message;
-    }
-
-    function tick() {
-        const t = now();
-
-        // Timer lateness approximates main-thread blocking that individual
-        // long tasks below the 50ms threshold still cause in aggregate.
-        if (lastTickAt !== null) {
-            const lateness = t - lastTickAt - tickMs;
-            if (lateness >= PROFILE_DRIFT_MIN_MS && !isHidden()) {
-                windowState.driftMs += lateness;
-                noteActivity();
-            }
-        }
-        lastTickAt = t;
-
-        const w = windowState;
-        const busyMs = Math.max(w.longTaskMs, w.driftMs);
-        const heavy = busyMs >= PROFILE_AUTO_THRESHOLD_MS
-            || w.ajaxMs >= PROFILE_AUTO_THRESHOLD_MS
-            || w.invokeMs >= PROFILE_AUTO_THRESHOLD_MS
-            || w.idbMs >= PROFILE_AUTO_THRESHOLD_MS
-            || w.timerMs >= PROFILE_AUTO_THRESHOLD_MS;
-        const quiet = lastActivityAt !== null && (t - lastActivityAt) >= PROFILE_QUIET_MS;
-        const spaced = (t - lastReportAt) >= PROFILE_MIN_INTERVAL_MS;
-
-        if (heavy && quiet && spaced) {
-            lastReportAt = t;
-            reportNow();
-            resetWindow();
-        }
-    }
-
-    function snapshot() {
-        const w = windowState;
-        return {
-            windowStartedAt: w.startedAt,
-            longTaskMs: w.longTaskMs,
-            longTaskCount: w.longTaskCount,
-            maxLongTaskMs: w.maxLongTaskMs,
-            driftMs: w.driftMs,
-            ajaxCount: w.ajaxCount,
-            ajaxMs: w.ajaxMs,
-            ajaxMaxMs: w.ajaxMaxMs,
-            ajaxByPath: [...w.ajaxByPath.entries()].map(([path, entry]) => ({ path, ...entry })),
-            invokeCount: w.invokeCount,
-            invokeMs: w.invokeMs,
-            invokeByCommand: [...w.invokeByCommand.entries()].map(([command, entry]) => ({ command, ...entry })),
-            idbCount: w.idbCount,
-            idbMs: w.idbMs,
-            idbByOp: [...w.idbByOp.entries()].map(([op, entry]) => ({ op, ...entry })),
-            timerCount: w.timerCount,
-            timerMs: w.timerMs,
-            timerByDelay: [...w.timerByDelay.entries()].map(([delay, entry]) => ({ delay, ...entry })),
-            rafCount: w.rafCount,
-            rafGapMs: w.rafGapMs,
-        };
-    }
-
-    return { tick, recordAjax, recordLongTask, recordInvoke, recordIdb, recordTimer, recordRafGap, snapshot, reportNow };
-}
-
-/** Starts observing main-thread long tasks (browser only, best-effort). */
-function observeLongTasks(profiler) {
-    try {
-        if (typeof PerformanceObserver === 'undefined') {
-            return;
-        }
-        const observer = new PerformanceObserver((list) => {
-            for (const entry of list.getEntries()) {
-                profiler.recordLongTask(entry.duration || 0);
-            }
-        });
-        observer.observe({ entryTypes: ['longtask'] });
-    } catch {
-        // Long Task API unavailable: the drift meter in tick() still works.
-    }
-}
-
-/** Times fetch() calls the same way ajax pass-throughs are timed. */
-function profileFetch(profiler) {
-    try {
-        const originalFetch = globalThis.fetch;
-        if (typeof originalFetch !== 'function' || originalFetch.__ttFteProfiled) {
-            return;
-        }
-        const profiledFetch = function (input, init) {
-            const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
-            let path = '';
-            try {
-                path = requestPathOf(typeof input === 'string' ? input : input?.url);
-            } catch {
-                path = 'fetch';
-            }
-            const promise = originalFetch.apply(this, arguments);
-            promise.then(
-                () => profiler.recordAjax(path, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt),
-                () => profiler.recordAjax(path, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt),
-            );
-            return promise;
-        };
-        profiledFetch.__ttFteProfiled = true;
-        globalThis.fetch = profiledFetch;
-    } catch {
-        // Best-effort only.
-    }
-}
-
-/** Shared instrumentation state so the broker-level and transport-level
- * wrappers do not double-count the same invoke call. */
-const INVOKE_INSTRUMENTATION = { insideBroker: false };
+const EXTENSION_VERSION = '4.0.0';
+const REGEX_BATCH_COMMAND = 'apply_native_regex_batch';
+const REGEX_BATCH_STORAGE_KEY = `tt:regex-cache:${EXTENSION_VERSION}`;
 
 /** FNV-1a 32-bit hash (stable across sessions). */
 function hashString(input) {
@@ -777,19 +50,14 @@ function hashString(input) {
 }
 
 /**
- * LRU cache for native-regex batch results.
- *
- * `apply_native_regex_batch` output is a pure function of each task's text and
- * its (depth-filtered) script list: identical input always yields identical
- * output. Prompt assembly re-runs the whole batch on unchanged chat content on
- * every generation (retries, viewer re-opens, regenerations), so memoizing
- * results turns repeat batches into instant cache hits while preserving
- * exact semantics (cached values are real Rust outputs, never estimates).
+ * LRU cache for native-regex batch results. Optional persistence adapter:
+ * `attachPersistence` loads synchronously, debounces saves, and flushes on
+ * pagehide; saves evict the oldest entries beyond the byte budget.
  */
 export function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 1024 * 1024) {
     const entries = new Map();
     let chars = 0;
-    /** @type {{ schedule: () => void, flush: () => void } | null} Set by attachPersistence. */
+    /** @type {{ schedule: () => void, flush: () => void } | null} */
     let persistence = null;
 
     const keyOf = (task) => hashString(JSON.stringify(task));
@@ -829,19 +97,15 @@ export function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 102
         persistence?.schedule();
     };
 
-    /** @returns {[string, string][]} Entries in LRU order (oldest first). */
-    const snapshotEntries = () => [...entries.entries()];
-
-    /** Empties the cache (memory only; callers decide about persistence). */
     const clear = () => {
         entries.clear();
         chars = 0;
     };
 
+    /** @returns {[string, string][]} Entries in LRU order (oldest first). */
+    const snapshotEntries = () => [...entries.entries()];
+
     /**
-     * Persists the cache across page sessions. Loading happens synchronously
-     * here; saves are debounced and flushed when the page hides, evicting the
-     * oldest entries when the storage quota or the byte budget is exceeded.
      * @param {{
      *   load: () => [string, string][] | null,
      *   save: (entries: [string, string][]) => void,
@@ -855,8 +119,7 @@ export function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 102
         const debounceMs = adapter.debounceMs ?? 1500;
         const autoSchedule = adapter.autoSchedule !== false;
         const maxBytes = adapter.maxBytes ?? 4 * 1024 * 1024;
-        // Capture before instrumentation wraps setTimeout, so the debounce
-        // timer is real wall-clock work and never shows up in the profiler.
+        // Capture before any other wrapper could replace setTimeout.
         const timerFn = globalThis.setTimeout;
         let timer = null;
 
@@ -864,7 +127,7 @@ export function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 102
         if (Array.isArray(loaded)) {
             for (const [key, text] of loaded) {
                 if (typeof key === 'string' && typeof text === 'string') {
-                    // persistence is still null here, so set() does not schedule.
+                    // persistence is null during load, so set() does not schedule.
                     set(key, text);
                 }
             }
@@ -878,7 +141,6 @@ export function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 102
             if (snapshot.length === 0) {
                 return;
             }
-            // Keep the persisted payload within the byte budget.
             while (snapshot.length > 0) {
                 const bytes = snapshot.reduce((total, [, text]) => total + text.length, 0);
                 if (bytes <= maxBytes) {
@@ -890,7 +152,6 @@ export function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 102
             try {
                 adapter.save(snapshot);
             } catch {
-                // Storage full: drop a quarter of the oldest entries, retry once.
                 const drop = Math.max(1, Math.floor(snapshot.length / 4));
                 for (let i = 0; i < drop && snapshot.length > 0; i += 1) {
                     deleteKey(snapshot[0][0]);
@@ -899,16 +160,13 @@ export function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 102
                 try {
                     adapter.save(snapshotEntries());
                 } catch {
-                    // Give up on persistence; in-memory cache keeps working.
+                    // Persistence is best-effort; the in-memory cache still works.
                 }
             }
         };
 
         const schedule = () => {
-            if (!autoSchedule) {
-                return;
-            }
-            if (timer !== null || typeof timerFn !== 'function') {
+            if (!autoSchedule || timer !== null || typeof timerFn !== 'function') {
                 return;
             }
             timer = timerFn(() => {
@@ -924,16 +182,10 @@ export function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 102
     return { keyOf, get, set, deleteKey, clear, size: () => entries.size, snapshotEntries, attachPersistence };
 }
 
-const REGEX_BATCH_COMMAND = 'apply_native_regex_batch';
-const REGEX_BATCH_CACHE = createRegexBatchCache();
-
 /**
- * Plans a regex-batch call against the cache.
- * Hit values are snapshotted so concurrent identical batches cannot make the
- * later merge diverge from the Rust subset response.
- * @param {ReturnType<typeof createRegexBatchCache>} cache
- * @param {any} args
- * @returns {{ kind: 'empty' } | { kind: 'all-hit', texts: string[] } | { kind: 'partial', hitTexts: (string | null)[], missIdx: number[], missTasks: any[] } | { kind: 'miss' }}
+ * Plans a batch against the cache. Hit values are snapshotted so concurrent
+ * identical batches cannot make the later merge diverge from the subset
+ * response.
  */
 function planRegexBatch(cache, args) {
     const tasks = args?.dto?.tasks;
@@ -966,10 +218,22 @@ function planRegexBatch(cache, args) {
     return { kind: 'partial', hitTexts, missIdx, missTasks };
 }
 
-/**
- * Merges a subset response into the full task order using the snapshot from
- * planning, then memoizes the freshly computed tasks.
- */
+/** Stores every task result of a completed batch for future calls. */
+function storeCachedRegexBatch(cache, args, response) {
+    const tasks = args?.dto?.tasks;
+    const results = response?.tasks;
+    if (!Array.isArray(tasks) || !Array.isArray(results) || tasks.length !== results.length) {
+        return;
+    }
+    for (let i = 0; i < tasks.length; i += 1) {
+        const text = results[i]?.text;
+        if (typeof text === 'string') {
+            cache.set(cache.keyOf(tasks[i]), text);
+        }
+    }
+}
+
+/** Merges a subset response into the full task order, then memoizes misses. */
 function mergePartialRegexResponse(plan, cache, args, response) {
     const results = response?.tasks;
     if (!Array.isArray(results) || results.length !== plan.missIdx.length) {
@@ -990,366 +254,89 @@ function mergePartialRegexResponse(plan, cache, args, response) {
     return { tasks: full };
 }
 
-/** Stores every task result of a completed batch for future calls. */
-function storeCachedRegexBatch(cache, args, response) {
-    const tasks = args?.dto?.tasks;
-    const results = response?.tasks;
-    if (!Array.isArray(tasks) || !Array.isArray(results) || tasks.length !== results.length) {
-        return;
-    }
-    for (let i = 0; i < tasks.length; i += 1) {
-        const text = results[i]?.text;
-        if (typeof text === 'string') {
-            cache.set(cache.keyOf(tasks[i]), text);
-        }
-    }
-}
+/** Module-level stats exposed for introspection (never surfaced in the UI). */
+const STATS = { hits: 0, partials: 0, misses: 0 };
 
 /**
- * Times every Tauri invoke by command name, from the transport level.
- * The Tauri runtime keeps its own transport (it does not go through the
- * patched global fetch), so invokes are otherwise invisible to the profiler —
- * yet single invokes such as the native regex batch or a chat save can hold
- * the prompt pipeline for seconds. `tauri-bridge.js` resolves
- * `window.__TAURI__.core.invoke` on every call, so replacing the property
- * intercepts every transport-level caller.
- *
- * When the broker wrapper (`profileInvokeBroker`) is also installed, calls
- * that reach this wrapper through the broker are counted there, so here they
- * are recorded under a `direct:` label only when the broker did not originate
- * them (e.g. broker calls that sat on a concurrency-limiter queue).
+ * Installs the cache wrapper on the host ABI invoke broker. Non-regex
+ * commands pass through untouched (no promise churn). Idempotent.
  */
-export function profileTauriInvoke(profiler, tauriLike = globalThis.__TAURI__, shared = INVOKE_INSTRUMENTATION) {
-    try {
-        const core = tauriLike?.core;
-        if (!core || typeof core.invoke !== 'function' || core.invoke.__ttFteProfiled) {
-            return false;
-        }
-
-        const originalInvoke = core.invoke;
-        const profiledInvoke = function (command, ...rest) {
-            // Snapshot at call time: the broker wrapper clears its flag as soon
-            // as `broker.invoke` returns, which happens before this promise
-            // settles. Calls that run inside the broker's synchronous section
-            // are already counted end-to-end by the broker wrapper (including
-            // any limiter-queue wait), so suppress them here to avoid
-            // double-counting. Only transport calls that escape the broker
-            // section (e.g. queued behind a concurrency limiter) are recorded
-            // here, under a `direct:` label.
-            const suppressed = shared.insideBroker;
-            const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
-            const result = originalInvoke.apply(this, [command, ...rest]);
-            if (suppressed) {
-                return result;
-            }
-            const label = `direct:${command}`;
-            const record = (ms) => profiler?.recordInvoke?.(label, ms);
-            try {
-                Promise.resolve(result).finally(() => {
-                    record((typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
-                }).catch(() => {
-                    // Only silences the timing chain, not the caller's promise.
-                });
-            } catch {
-                record((typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
-            }
-            return result;
-        };
-        profiledInvoke.__ttFteProfiled = true;
-        try {
-            core.invoke = profiledInvoke;
-        } catch {
-            // Injected `core` may expose read-only accessors (e.g. getter-only
-            // `invoke`); the broker wrapper below still covers routed traffic.
-            return false;
-        }
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-/**
- * Times every routed Tauri invoke at the host ABI's invoke-broker boundary,
- * and memoizes native-regex batch results (see `createRegexBatchCache`).
- * Every `safeInvoke` in the app (route handlers, native regex batch, chat
- * saves, ...) resolves `invokeBroker.invoke` dynamically on the plain object
- * exposed as `__TAURITAVERN__.invoke.broker`, so replacing that method is the
- * most reliable single choke point and survives read-only `__TAURI__` cores.
- */
-export function profileInvokeBroker(profiler, abiLike = globalThis.__TAURITAVERN__, shared = INVOKE_INSTRUMENTATION, regexCache = REGEX_BATCH_CACHE) {
+export function installRegexBatchCacheBroker(abiLike = globalThis.__TAURITAVERN__, cache = REGEX_BATCH_CACHE) {
     try {
         const broker = abiLike?.invoke?.broker;
-        if (!broker || typeof broker.invoke !== 'function' || broker.invoke.__ttFteProfiled) {
+        if (!broker || typeof broker.invoke !== 'function' || broker.invoke.__ttRegexBatchCached) {
             return false;
         }
 
         const originalInvoke = broker.invoke;
-        const profiledInvoke = function (command, args) {
-            // Regex-batch cache: serve fully cached batches locally, and for
-            // partially cached batches send only the missing tasks to Rust.
-            let regexPlan = null;
-            if (command === REGEX_BATCH_COMMAND && regexCache) {
-                regexPlan = planRegexBatch(regexCache, args);
-                if (regexPlan.kind === 'all-hit') {
-                    const stats = globalThis.__TT_FRONTEND_TOKENIZER__?.stats;
-                    if (stats) {
-                        stats.regexCacheHits = (stats.regexCacheHits || 0) + 1;
-                    }
-                    return Promise.resolve({ tasks: regexPlan.texts.map((text) => ({ text })) });
-                }
+        const wrappedInvoke = function (command, args) {
+            if (command !== REGEX_BATCH_COMMAND || !cache) {
+                return originalInvoke.call(broker, command, args);
             }
 
-            const isPartial = regexPlan?.kind === 'partial';
-            const invokeArgs = isPartial ? { dto: { tasks: regexPlan.missTasks } } : args;
-
-            const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
-            shared.insideBroker = true;
-            let result;
-            try {
-                result = originalInvoke.call(broker, command, invokeArgs);
-            } finally {
-                shared.insideBroker = false;
+            const plan = planRegexBatch(cache, args);
+            if (plan.kind === 'all-hit') {
+                STATS.hits += 1;
+                return Promise.resolve({ tasks: plan.texts.map((text) => ({ text })) });
+            }
+            if (plan.kind === 'empty') {
+                return originalInvoke.call(broker, command, args);
             }
 
-            const settled = Promise.resolve(result);
-            // Partial batches: merge the Rust subset response back into the
-            // full task order so callers see a complete response; then cache
-            // the freshly computed tasks for future calls.
-            const returned = isPartial
-                ? settled.then((response) => {
-                    const merged = mergePartialRegexResponse(regexPlan, regexCache, args, response);
-                    profiler?.recordInvoke?.('regex-batch-partial', (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
-                    return merged;
-                }, (error) => {
-                    throw error;
-                })
-                : settled;
+            const isPartial = plan.kind === 'partial';
+            const invokeArgs = isPartial ? { dto: { tasks: plan.missTasks } } : args;
+            const result = originalInvoke.call(broker, command, invokeArgs);
 
-            if (command === REGEX_BATCH_COMMAND && regexCache && !isPartial) {
-                returned.then((response) => {
-                    storeCachedRegexBatch(regexCache, args, response);
-                }).catch(() => {
-                    // Failed batches are not cached.
-                });
+            if (isPartial) {
+                STATS.partials += 1;
+                return Promise.resolve(result).then(
+                    (response) => mergePartialRegexResponse(plan, cache, args, response),
+                    (error) => { throw error; },
+                );
             }
 
-            returned.finally(() => {
-                profiler?.recordInvoke?.(String(command), (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+            STATS.misses += 1;
+            Promise.resolve(result).then((response) => {
+                storeCachedRegexBatch(cache, args, response);
             }).catch(() => {
-                // Only silences the timing chain, not the caller's promise.
+                // Failed batches are not cached.
             });
-
-            return returned;
+            return result;
         };
-        profiledInvoke.__ttFteProfiled = true;
-        broker.invoke = profiledInvoke;
+        wrappedInvoke.__ttRegexBatchCached = true;
+        broker.invoke = wrappedInvoke;
         return true;
     } catch {
         return false;
     }
 }
 
-/**
- * Records long `setTimeout` waits and throttled `requestAnimationFrame` gaps.
- * Both are pure waiting time that no other meter sees: main-thread idle,
- * no requests, no invokes, no IndexedDB. A 30-second assembly made of
- * `await delay(...)` chains or rAF-throttled UI updates would show up here.
- */
-export function profileWaits(profiler, globalObject = globalThis) {
-    let changed = false;
-
-    try {
-        const originalSetTimeout = globalObject.setTimeout;
-        if (typeof originalSetTimeout === 'function' && !originalSetTimeout.__ttFteProfiled) {
-            const MIN_DELAY_MS = 500;
-            const profiledSetTimeout = function (fn, delay = 0, ...rest) {
-                const delayMs = Number(delay) || 0;
-                const scheduledAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
-                if (delayMs >= MIN_DELAY_MS) {
-                    const wrapped = function (...args) {
-                        try {
-                            return typeof fn === 'function' ? fn.apply(this, args) : fn;
-                        } finally {
-                            profiler.recordTimer(delayMs, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - scheduledAt);
-                        }
-                    };
-                    return originalSetTimeout.call(this, wrapped, delay, ...rest);
-                }
-                return originalSetTimeout.call(this, fn, delay, ...rest);
-            };
-            profiledSetTimeout.__ttFteProfiled = true;
-            try {
-                globalObject.setTimeout = profiledSetTimeout;
-                changed = true;
-            } catch {
-                // Non-writable binding: skip.
-            }
-        }
-    } catch {
-        // Best-effort only.
-    }
-
-    try {
-        const originalRaf = globalObject.requestAnimationFrame;
-        if (typeof originalRaf === 'function' && !originalRaf.__ttFteProfiled) {
-            const MIN_GAP_MS = 100;
-            const profiledRaf = function (callback) {
-                const scheduledAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
-                return originalRaf.call(this, (timestamp) => {
-                    const gap = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - scheduledAt;
-                    if (gap >= MIN_GAP_MS) {
-                        profiler.recordRafGap(gap);
-                    }
-                    return callback(timestamp);
-                });
-            };
-            profiledRaf.__ttFteProfiled = true;
-            try {
-                globalObject.requestAnimationFrame = profiledRaf;
-                changed = true;
-            } catch {
-                // Non-writable binding: skip.
-            }
-        }
-    } catch {
-        // Best-effort only.
-    }
-
-    return changed;
-}
+/** Shared default cache instance (module-level for the page). */
+const REGEX_BATCH_CACHE = createRegexBatchCache();
 
 /**
- * Times IndexedDB object-store reads/writes, the other invisible async sink
- * (localforage token-cache buckets, settings stores). Best-effort: wraps the
- * prototype methods and measures until the request settles.
- */
-export function profileIndexedDb(profiler, globalObject = globalThis) {
-    try {
-        const storeProto = globalObject.IDBObjectStore?.prototype;
-        if (!storeProto || storeProto.get.__ttFteProfiled) {
-            return false;
-        }
-
-        /** @param {'get'|'put'|'add'|'delete'} op */
-        const wrap = (op) => {
-            const original = storeProto[op];
-            if (typeof original !== 'function') {
-                return;
-            }
-            const wrapped = function (...args) {
-                const request = original.apply(this, args);
-                const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
-                const label = `${op}:${this.name ?? '?'}`;
-                try {
-                    request.addEventListener('success', () => {
-                        profiler.recordIdb(label, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
-                    }, { once: true });
-                    request.addEventListener('error', () => {
-                        profiler.recordIdb(label, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
-                    }, { once: true });
-                } catch {
-                    // Request without events: fall through unmeasured.
-                }
-                return request;
-            };
-            wrapped.__ttFteProfiled = true;
-            storeProto[op] = wrapped;
-        };
-
-        for (const op of ['get', 'put', 'add', 'delete']) {
-            wrap(op);
-        }
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-/** Floating "Σ" button that re-shows the profiler report (double-tap hides). */
-function installProbeButton(profiler) {
-    try {
-        if (typeof document === 'undefined' || document.getElementById('tt-fte-probe')) {
-            return;
-        }
-        const button = document.createElement('div');
-        button.id = 'tt-fte-probe';
-        button.textContent = 'Σ';
-        button.title = 'Token Estimator 性能剖析（双击隐藏）';
-        Object.assign(button.style, {
-            position: 'fixed',
-            right: '14px',
-            bottom: '140px',
-            width: '34px',
-            height: '34px',
-            borderRadius: '50%',
-            background: 'rgba(90, 90, 110, 0.55)',
-            color: '#fff',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            fontSize: '16px',
-            fontWeight: 'bold',
-            zIndex: '2147483000',
-            cursor: 'pointer',
-            userSelect: 'none',
-            opacity: '0.6',
-        });
-        let lastTap = 0;
-        button.addEventListener('click', () => {
-            const now = Date.now();
-            if (now - lastTap < 400) {
-                button.remove();
-                return;
-            }
-            lastTap = now;
-            profiler.reportNow();
-        });
-        document.body.appendChild(button);
-    } catch {
-        // Best-effort only.
-    }
-}
-
-/**
- * Persists the native-regex batch cache in localStorage so repeat assemblies
- * stay fast across page reloads (otherwise the first Rust batch after every
- * app start costs 30-60s again). The key is versioned and every cache entry
- * is keyed by task text + script definitions, so edits to messages or regex
- * scripts naturally invalidate themselves; a TauriTavern update that changes
- * regex semantics gets a fresh bucket via the version suffix.
- * @returns {{ flush: () => void, clear: () => void } | null}
+ * Persists the cache in localStorage (4MB budget, versioned bucket). Entries
+ * are keyed by task text + script definitions, so content/script edits
+ * invalidate naturally; an extension update changes the bucket.
  */
 function installRegexCachePersistence(cache) {
     try {
         if (typeof globalThis.localStorage === 'undefined') {
             return null;
         }
-        const storageKey = `tt:fte:regexCache:${EXTENSION_VERSION}`;
         const adapter = {
             load: () => {
-                const raw = globalThis.localStorage.getItem(storageKey);
-                if (!raw) {
-                    return null;
-                }
-                return JSON.parse(raw);
+                const raw = globalThis.localStorage.getItem(REGEX_BATCH_STORAGE_KEY);
+                return raw ? JSON.parse(raw) : null;
             },
             save: (entries) => {
-                globalThis.localStorage.setItem(storageKey, JSON.stringify(entries));
+                globalThis.localStorage.setItem(REGEX_BATCH_STORAGE_KEY, JSON.stringify(entries));
             },
             remove: () => {
-                globalThis.localStorage.removeItem(storageKey);
+                globalThis.localStorage.removeItem(REGEX_BATCH_STORAGE_KEY);
             },
         };
         const { flush } = cache.attachPersistence(adapter);
-        const clear = () => {
-            try {
-                cache.clear();
-                adapter.remove?.();
-            } catch {
-                // Best-effort only.
-            }
-        };
         if (typeof window !== 'undefined') {
             window.addEventListener('pagehide', flush);
         }
@@ -1360,82 +347,48 @@ function installRegexCachePersistence(cache) {
                 }
             });
         }
-        return { flush, clear };
+        return { flush, clear: () => { cache.clear(); adapter.remove?.(); } };
     } catch {
-        // localStorage unavailable or corrupted: in-memory cache only.
         return null;
     }
 }
 
-/**
- * Re-asserts instrumentation patches. When the profiler is off (default),
- * only the invoke-broker wrapper needed for the regex-batch cache is kept;
- * the fetch/invoke/IndexedDB/timer meters are diagnostic-only overhead.
- * @param {ReturnType<typeof createProfiler> | null} profiler
- */
-function reassertInstrumentation(profiler) {
-    if (profiler) {
-        profileFetch(profiler);
-        profileTauriInvoke(profiler);
-        profileIndexedDb(profiler);
-        profileWaits(profiler);
-    }
-    // The broker wrapper memoizes native-regex batches; timing is optional.
-    profileInvokeBroker(profiler);
-}
-
-if (typeof globalThis.jQuery !== 'undefined') {
-    const profileEnabled = isProfileEnabled();
-
-    installFrontendTokenizer(globalThis.jQuery);
-    // Capture after install: installFrontendTokenizer rebuilds the global
-    // state object (spread + stats).
-    const runtime = globalThis.__TT_FRONTEND_TOKENIZER__;
-    // Notifications are opt-in (see isNotificationEnabled); the watchdog keeps
-    // recovering silently otherwise.
-    const guard = activateFrontendTokenizerGuard(() => globalThis.jQuery, {
-        notify: (message) => {
-            if (isNotificationEnabled()) {
-                showNotification(message);
-            }
+// Browser-only bootstrap: the extension only ever runs inside the app page.
+if (typeof globalThis.document !== 'undefined') {
+    const persistence = installRegexCachePersistence(REGEX_BATCH_CACHE);
+    globalThis.__TT_REGEX_CACHE__ = {
+        version: EXTENSION_VERSION,
+        stats: STATS,
+        size: () => REGEX_BATCH_CACHE.size(),
+        clear: () => {
+            REGEX_BATCH_CACHE.clear();
+            persistence?.clear();
         },
-    });
-
-    let profiler = null;
-    if (profileEnabled) {
-        profiler = createProfiler({
-            notify: (message) => {
-                if (isNotificationEnabled()) {
-                    showNotification(message, 30_000);
-                }
-            },
-            backendCountDelta: () => guard.backendCountDelta(),
-        });
-        activeProfiler = profiler;
-        runtime.profile = () => profiler.snapshot();
-        observeLongTasks(profiler);
-        installProbeButton(profiler);
-    }
-
-    // Persistence must attach before instrumentation wraps setTimeout so the
-    // debounced flush uses the native timer and stays out of the profiler.
-    const regexPersistence = installRegexCachePersistence(REGEX_BATCH_CACHE);
-    runtime.clearRegexCache = () => {
-        REGEX_BATCH_CACHE.clear();
-        regexPersistence?.clear();
     };
 
-    reassertInstrumentation(profiler);
-
-    // Fast tick: re-assert the interceptor quickly when displaced, keep the
-    // broker cache wrapper outermost, and drive profiler checks when enabled.
-    const guardTimer = setInterval(() => {
-        guard.tick();
-        reassertInstrumentation(profiler);
-        if (profiler) {
-            profiler.tick();
+    const ensureInstalled = () => {
+        const installed = installRegexBatchCacheBroker();
+        if (installed) {
+            console.log(`[Rust Regex Batch Cache] active (v${EXTENSION_VERSION})`);
         }
-    }, PROFILE_TICK_MS);
-    // Do not keep Node test contexts alive on account of the watchdog.
+        return installed;
+    };
+    if (!ensureInstalled()) {
+        // The ABI may be injected after this module runs; retry silently.
+        const retryTimer = setInterval(() => {
+            if (ensureInstalled()) {
+                clearInterval(retryTimer);
+            }
+        }, 1000);
+        retryTimer?.unref?.();
+    }
+
+    // Re-assert if the broker wrapper ever gets displaced; cheap marker check.
+    const guardTimer = setInterval(() => {
+        const broker = globalThis.__TAURITAVERN__?.invoke?.broker;
+        if (broker && typeof broker.invoke === 'function' && !broker.invoke.__ttRegexBatchCached) {
+            ensureInstalled();
+        }
+    }, 2000);
     guardTimer?.unref?.();
 }
