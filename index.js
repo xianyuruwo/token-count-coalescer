@@ -43,7 +43,7 @@
 const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
 const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
 const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
-const EXTENSION_VERSION = '2.2.0';
+const EXTENSION_VERSION = '2.3.0';
 /** Invoke-broker commands whose counters reveal backend-side token counting. */
 const BACKEND_COUNT_COMMANDS = ['count_openai_tokens', 'count_openai_tokens_batch'];
 
@@ -327,10 +327,16 @@ export function activateFrontendTokenizerGuard(getJQuery, { notify = () => {}, t
         // Re-assert the interceptor if anything replaced it (host re-patch,
         // other extensions, page scripts).
         if (jQueryLike.ajax.__ttFrontendTokenizer !== true) {
+            // Log a snippet of the displacer to help identify who buried us.
+            try {
+                const displacer = String(jQueryLike.ajax).slice(0, 120).replace(/\s+/g, ' ');
+                console.warn('[Frontend Tokenizer] jQuery.ajax patch was displaced by:', displacer);
+            } catch {
+                console.warn('[Frontend Tokenizer] jQuery.ajax patch was displaced');
+            }
             installFrontendTokenizer(jQueryLike);
             const stats = getStats();
             stats.reasserted = (stats.reasserted || 0) + 1;
-            console.warn('[Frontend Tokenizer] jQuery.ajax patch was displaced; re-asserted');
             if (!displacementNotified) {
                 displacementNotified = true;
                 notify('检测到 jQuery.ajax 补丁被覆盖，已自动恢复拦截');
@@ -355,7 +361,9 @@ export function activateFrontendTokenizerGuard(getJQuery, { notify = () => {}, t
 if (typeof globalThis.jQuery !== 'undefined') {
     installFrontendTokenizer(globalThis.jQuery);
     const guard = activateFrontendTokenizerGuard(() => globalThis.jQuery, { notify: showNotification });
-    const guardTimer = setInterval(() => guard.tick(), 1500);
+    // Fast tick: the host and some extensions replace jQuery.ajax at startup,
+    // so a short window keeps leaked backend counts near zero.
+    const guardTimer = setInterval(() => guard.tick(), 300);
     // Do not keep Node test contexts alive on account of the watchdog.
     guardTimer?.unref?.();
 }
