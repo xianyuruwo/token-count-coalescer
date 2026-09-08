@@ -34,9 +34,14 @@
  * caused by token counting, the extension also measures where page time goes:
  *   - main-thread long tasks (PerformanceObserver) and timer drift
  *   - wall time of every ajax/fetch request passed through to the host
+ * v3.1.0 closes the two remaining invisible async sinks:
+ *   - Tauri invokes (`window.__TAURI__.core.invoke`): the native regex batch,
+ *     chat saves, etc. bypass the fetch patch because the Tauri runtime holds
+ *     its own transport; each invoke is now timed by command name
+ *   - IndexedDB reads/writes (localforage token cache / settings buckets)
  * After a busy period it pops a summary toast ("TT 性能剖析") stating whether
- * the time was spent blocking the main thread (rendering / regex / extension
- * scripts) or waiting on backend requests, plus estimator/guard counters.
+ * the time was spent blocking the main thread, waiting on HTTP requests,
+ * waiting on Tauri invokes (with per-command totals), or in IndexedDB.
  * A small floating "Σ" button re-shows the report on demand
  * (double-tap hides it).
  *
@@ -49,7 +54,7 @@
 const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
 const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
 const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
-const EXTENSION_VERSION = '3.0.0';
+const EXTENSION_VERSION = '3.1.0';
 /** Invoke-broker commands whose counters reveal backend-side token counting. */
 const BACKEND_COUNT_COMMANDS = ['count_openai_tokens', 'count_openai_tokens_batch'];
 /** Profiler: report once a window accumulates this much busy time (ms). */
@@ -428,6 +433,8 @@ function fmtSeconds(ms) {
  *   tick: () => void,
  *   recordAjax: (path: string, ms: number) => void,
  *   recordLongTask: (ms: number) => void,
+ *   recordInvoke: (command: string, ms: number) => void,
+ *   recordIdb: (op: string, ms: number) => void,
  *   snapshot: () => object,
  *   reportNow: () => string,
  * }}
@@ -457,6 +464,12 @@ export function createProfiler(options = {}) {
             ajaxMs: 0,
             ajaxMaxMs: 0,
             ajaxByPath: new Map(),
+            invokeCount: 0,
+            invokeMs: 0,
+            invokeByCommand: new Map(),
+            idbCount: 0,
+            idbMs: 0,
+            idbByOp: new Map(),
         };
     }
 
@@ -464,15 +477,38 @@ export function createProfiler(options = {}) {
         lastActivityAt = now();
     }
 
+    /**
+     * @param {Map<string, {count: number, ms: number, maxMs: number}>} map
+     * @param {string} key
+     * @param {number} ms
+     */
+    function bumpEntry(map, key, ms) {
+        const entry = map.get(key) ?? { count: 0, ms: 0, maxMs: 0 };
+        entry.count += 1;
+        entry.ms += ms;
+        entry.maxMs = Math.max(entry.maxMs, ms);
+        map.set(key, entry);
+    }
+
+    /**
+     * @param {Map<string, {count: number, ms: number, maxMs: number}>} map
+     * @param {number} limit
+     * @returns {string} "cmd ×N (Xs, max Ys)" fragments joined by 、
+     */
+    function topEntries(map, limit) {
+        return [...map.entries()]
+            .sort((a, b) => b[1].ms - a[1].ms)
+            .slice(0, limit)
+            .map(([key, entry]) => `${key} ×${entry.count} (${fmtSeconds(entry.ms)}${entry.count > 1 ? `, 最长 ${fmtSeconds(entry.maxMs)}` : ''})`)
+            .join('、');
+    }
+
     function recordAjax(path, ms) {
         const w = windowState;
         w.ajaxCount += 1;
         w.ajaxMs += ms;
         w.ajaxMaxMs = Math.max(w.ajaxMaxMs, ms);
-        const entry = w.ajaxByPath.get(path) ?? { count: 0, ms: 0 };
-        entry.count += 1;
-        entry.ms += ms;
-        w.ajaxByPath.set(path, entry);
+        bumpEntry(w.ajaxByPath, path, ms);
         noteActivity();
     }
 
@@ -481,6 +517,22 @@ export function createProfiler(options = {}) {
         w.longTaskMs += ms;
         w.longTaskCount += 1;
         w.maxLongTaskMs = Math.max(w.maxLongTaskMs, ms);
+        noteActivity();
+    }
+
+    function recordInvoke(command, ms) {
+        const w = windowState;
+        w.invokeCount += 1;
+        w.invokeMs += ms;
+        bumpEntry(w.invokeByCommand, String(command || 'unknown'), ms);
+        noteActivity();
+    }
+
+    function recordIdb(op, ms) {
+        const w = windowState;
+        w.idbCount += 1;
+        w.idbMs += ms;
+        bumpEntry(w.idbByOp, String(op || 'idb'), ms);
         noteActivity();
     }
 
@@ -495,19 +547,21 @@ export function createProfiler(options = {}) {
         const reassertedDelta = (stats.reasserted || 0) - lastSeenReasserted;
         const elapsedMs = Date.now() - w.startedAt;
         const busyMs = Math.max(w.longTaskMs, w.driftMs);
-        const slowestPaths = [...w.ajaxByPath.entries()]
-            .sort((a, b) => b[1].ms - a[1].ms)
-            .slice(0, 3)
-            .map(([path, entry]) => `${path} ×${entry.count} (${fmtSeconds(entry.ms)})`)
-            .join('、');
 
         const lines = [
             `TT 性能剖析（最近 ${(elapsedMs / 1000).toFixed(1)}s）：`,
             `主线程繁忙 ${fmtSeconds(busyMs)}（长任务 ${fmtSeconds(w.longTaskMs)}/${w.longTaskCount} 次，最大 ${fmtSeconds(w.maxLongTaskMs)}；计时漂移 ${fmtSeconds(w.driftMs)}）`,
-            `后端请求 ${w.ajaxCount} 次，共 ${fmtSeconds(w.ajaxMs)}（最慢单次 ${fmtSeconds(w.ajaxMaxMs)}）`,
+            `HTTP 请求 ${w.ajaxCount} 次，共 ${fmtSeconds(w.ajaxMs)}（最慢单次 ${fmtSeconds(w.ajaxMaxMs)}）`,
         ];
-        if (slowestPaths) {
-            lines.push(`最耗时请求：${slowestPaths}`);
+        if (w.ajaxByPath.size > 0) {
+            lines.push(`最耗时请求：${topEntries(w.ajaxByPath, 3)}`);
+        }
+        lines.push(`Tauri 调用 ${w.invokeCount} 次，共 ${fmtSeconds(w.invokeMs)}`);
+        if (w.invokeByCommand.size > 0) {
+            lines.push(`最耗时调用：${topEntries(w.invokeByCommand, 4)}`);
+        }
+        if (w.idbCount > 0) {
+            lines.push(`IndexedDB ${w.idbCount} 次，共 ${fmtSeconds(w.idbMs)}${w.idbByOp.size > 0 ? `（${topEntries(w.idbByOp, 2)}）` : ''}`);
         }
         lines.push(`本地估算 ${interceptedDelta} 次｜补丁恢复 ${reassertedDelta} 次｜后端计数 ${backendCountDelta()} 次`);
         return lines.join('<br>');
@@ -544,7 +598,10 @@ export function createProfiler(options = {}) {
 
         const w = windowState;
         const busyMs = Math.max(w.longTaskMs, w.driftMs);
-        const heavy = busyMs >= PROFILE_AUTO_THRESHOLD_MS || w.ajaxMs >= PROFILE_AUTO_THRESHOLD_MS;
+        const heavy = busyMs >= PROFILE_AUTO_THRESHOLD_MS
+            || w.ajaxMs >= PROFILE_AUTO_THRESHOLD_MS
+            || w.invokeMs >= PROFILE_AUTO_THRESHOLD_MS
+            || w.idbMs >= PROFILE_AUTO_THRESHOLD_MS;
         const quiet = lastActivityAt !== null && (t - lastActivityAt) >= PROFILE_QUIET_MS;
         const spaced = (t - lastReportAt) >= PROFILE_MIN_INTERVAL_MS;
 
@@ -567,10 +624,16 @@ export function createProfiler(options = {}) {
             ajaxMs: w.ajaxMs,
             ajaxMaxMs: w.ajaxMaxMs,
             ajaxByPath: [...w.ajaxByPath.entries()].map(([path, entry]) => ({ path, ...entry })),
+            invokeCount: w.invokeCount,
+            invokeMs: w.invokeMs,
+            invokeByCommand: [...w.invokeByCommand.entries()].map(([command, entry]) => ({ command, ...entry })),
+            idbCount: w.idbCount,
+            idbMs: w.idbMs,
+            idbByOp: [...w.idbByOp.entries()].map(([op, entry]) => ({ op, ...entry })),
         };
     }
 
-    return { tick, recordAjax, recordLongTask, snapshot, reportNow };
+    return { tick, recordAjax, recordLongTask, recordInvoke, recordIdb, snapshot, reportNow };
 }
 
 /** Starts observing main-thread long tasks (browser only, best-effort). */
@@ -616,6 +679,91 @@ function profileFetch(profiler) {
         globalThis.fetch = profiledFetch;
     } catch {
         // Best-effort only.
+    }
+}
+
+/**
+ * Times every Tauri invoke by command name. The Tauri runtime keeps its own
+ * transport (it does not go through the patched global fetch), so invokes are
+ * otherwise invisible to the profiler — yet single invokes such as the native
+ * regex batch or a chat save can hold the prompt pipeline for seconds.
+ * `tauri-bridge.js` resolves `window.__TAURI__.core.invoke` on every call, so
+ * replacing the property intercepts every caller.
+ */
+export function profileTauriInvoke(profiler, tauriLike = globalThis.__TAURI__) {
+    try {
+        const core = tauriLike?.core;
+        if (!core || typeof core.invoke !== 'function' || core.invoke.__ttFteProfiled) {
+            return false;
+        }
+
+        const originalInvoke = core.invoke;
+        const profiledInvoke = function (command, ...rest) {
+            const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+            const result = originalInvoke.apply(this, [command, ...rest]);
+            try {
+                Promise.resolve(result).finally(() => {
+                    profiler.recordInvoke(String(command), (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+                }).catch(() => {
+                    // Only silences the timing chain, not the caller's promise.
+                });
+            } catch {
+                profiler.recordInvoke(String(command), (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+            }
+            return result;
+        };
+        profiledInvoke.__ttFteProfiled = true;
+        core.invoke = profiledInvoke;
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Times IndexedDB object-store reads/writes, the other invisible async sink
+ * (localforage token-cache buckets, settings stores). Best-effort: wraps the
+ * prototype methods and measures until the request settles.
+ */
+export function profileIndexedDb(profiler, globalObject = globalThis) {
+    try {
+        const storeProto = globalObject.IDBObjectStore?.prototype;
+        if (!storeProto || storeProto.get.__ttFteProfiled) {
+            return false;
+        }
+
+        /** @param {'get'|'put'|'add'|'delete'} op */
+        const wrap = (op) => {
+            const original = storeProto[op];
+            if (typeof original !== 'function') {
+                return;
+            }
+            const wrapped = function (...args) {
+                const request = original.apply(this, args);
+                const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+                const label = `${op}:${this.name ?? '?'}`;
+                try {
+                    request.addEventListener('success', () => {
+                        profiler.recordIdb(label, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+                    }, { once: true });
+                    request.addEventListener('error', () => {
+                        profiler.recordIdb(label, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+                    }, { once: true });
+                } catch {
+                    // Request without events: fall through unmeasured.
+                }
+                return request;
+            };
+            wrapped.__ttFteProfiled = true;
+            storeProto[op] = wrapped;
+        };
+
+        for (const op of ['get', 'put', 'add', 'delete']) {
+            wrap(op);
+        }
+        return true;
+    } catch {
+        return false;
     }
 }
 
@@ -675,6 +823,8 @@ if (typeof globalThis.jQuery !== 'undefined') {
     globalThis.__TT_FRONTEND_TOKENIZER__.profile = () => profiler.snapshot();
     observeLongTasks(profiler);
     profileFetch(profiler);
+    profileTauriInvoke(profiler);
+    profileIndexedDb(profiler);
     installProbeButton(profiler);
     // Fast tick: re-assert the interceptor quickly when displaced and drive
     // the profiler window checks.
