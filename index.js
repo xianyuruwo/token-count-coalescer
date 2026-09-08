@@ -62,7 +62,7 @@
 const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
 const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
 const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
-const EXTENSION_VERSION = '3.3.0';
+const EXTENSION_VERSION = '3.4.0';
 /** Invoke-broker commands whose counters reveal backend-side token counting. */
 const BACKEND_COUNT_COMMANDS = ['count_openai_tokens', 'count_openai_tokens_batch'];
 /** Profiler: report once a window accumulates this much busy time (ms). */
@@ -798,25 +798,66 @@ const REGEX_BATCH_COMMAND = 'apply_native_regex_batch';
 const REGEX_BATCH_CACHE = createRegexBatchCache();
 
 /**
- * All-or-nothing memoized response for a native-regex batch call.
+ * Plans a regex-batch call against the cache.
+ * Hit values are snapshotted so concurrent identical batches cannot make the
+ * later merge diverge from the Rust subset response.
  * @param {ReturnType<typeof createRegexBatchCache>} cache
  * @param {any} args
- * @returns {{ tasks: { text: string }[] } | null} Cached response or null.
+ * @returns {{ kind: 'empty' } | { kind: 'all-hit', texts: string[] } | { kind: 'partial', hitTexts: (string | null)[], missIdx: number[], missTasks: any[] } | { kind: 'miss' }}
  */
-function tryServeCachedRegexBatch(cache, args) {
+function planRegexBatch(cache, args) {
     const tasks = args?.dto?.tasks;
     if (!Array.isArray(tasks) || tasks.length === 0) {
-        return null;
+        return { kind: 'empty' };
     }
-    const texts = new Array(tasks.length);
+
+    const hitTexts = new Array(tasks.length);
+    const missIdx = [];
+    const missTasks = [];
+    let hitCount = 0;
     for (let i = 0; i < tasks.length; i += 1) {
         const cached = cache.get(cache.keyOf(tasks[i]));
-        if (cached === undefined) {
-            return null;
+        if (cached !== undefined) {
+            hitTexts[i] = cached;
+            hitCount += 1;
+        } else {
+            hitTexts[i] = null;
+            missIdx.push(i);
+            missTasks.push(tasks[i]);
         }
-        texts[i] = cached;
     }
-    return { tasks: texts.map((text) => ({ text })) };
+
+    if (hitCount === tasks.length) {
+        return { kind: 'all-hit', texts: hitTexts };
+    }
+    if (hitCount === 0) {
+        return { kind: 'miss' };
+    }
+    return { kind: 'partial', hitTexts, missIdx, missTasks };
+}
+
+/**
+ * Merges a subset response into the full task order using the snapshot from
+ * planning, then memoizes the freshly computed tasks.
+ */
+function mergePartialRegexResponse(plan, cache, args, response) {
+    const results = response?.tasks;
+    if (!Array.isArray(results) || results.length !== plan.missIdx.length) {
+        throw new Error('Native regex partial response length mismatch');
+    }
+    storeCachedRegexBatch(cache, { dto: { tasks: plan.missTasks } }, response);
+
+    const tasks = args.dto.tasks;
+    const full = new Array(tasks.length);
+    for (let i = 0; i < tasks.length; i += 1) {
+        if (plan.hitTexts[i] !== null) {
+            full[i] = { text: plan.hitTexts[i] };
+        }
+    }
+    for (let k = 0; k < plan.missIdx.length; k += 1) {
+        full[plan.missIdx[k]] = results[k];
+    }
+    return { tasks: full };
 }
 
 /** Stores every task result of a completed batch for future calls. */
@@ -915,49 +956,61 @@ export function profileInvokeBroker(profiler, abiLike = globalThis.__TAURITAVERN
 
         const originalInvoke = broker.invoke;
         const profiledInvoke = function (command, args) {
-            // Whole-batch regex cache hit: answer locally, no Rust round trip.
+            // Regex-batch cache: serve fully cached batches locally, and for
+            // partially cached batches send only the missing tasks to Rust.
+            let regexPlan = null;
             if (command === REGEX_BATCH_COMMAND && regexCache) {
-                const cached = tryServeCachedRegexBatch(regexCache, args);
-                if (cached) {
+                regexPlan = planRegexBatch(regexCache, args);
+                if (regexPlan.kind === 'all-hit') {
                     const stats = globalThis.__TT_FRONTEND_TOKENIZER__?.stats;
                     if (stats) {
                         stats.regexCacheHits = (stats.regexCacheHits || 0) + 1;
                     }
-                    return Promise.resolve(cached);
+                    return Promise.resolve({ tasks: regexPlan.texts.map((text) => ({ text })) });
                 }
             }
+
+            const isPartial = regexPlan?.kind === 'partial';
+            const invokeArgs = isPartial ? { dto: { tasks: regexPlan.missTasks } } : args;
 
             const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
             shared.insideBroker = true;
             let result;
             try {
-                result = originalInvoke.call(broker, command, args);
+                result = originalInvoke.call(broker, command, invokeArgs);
             } finally {
                 shared.insideBroker = false;
             }
-            try {
-                Promise.resolve(result).finally(() => {
-                    profiler.recordInvoke(String(command), (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+
+            const settled = Promise.resolve(result);
+            // Partial batches: merge the Rust subset response back into the
+            // full task order so callers see a complete response; then cache
+            // the freshly computed tasks for future calls.
+            const returned = isPartial
+                ? settled.then((response) => {
+                    const merged = mergePartialRegexResponse(regexPlan, regexCache, args, response);
+                    profiler.recordInvoke('regex-batch-partial', (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+                    return merged;
+                }, (error) => {
+                    throw error;
+                })
+                : settled;
+
+            if (command === REGEX_BATCH_COMMAND && regexCache && !isPartial) {
+                returned.then((response) => {
+                    storeCachedRegexBatch(regexCache, args, response);
                 }).catch(() => {
-                    // Only silences the timing chain, not the caller's promise.
+                    // Failed batches are not cached.
                 });
-            } catch {
+            }
+
+            returned.finally(() => {
                 profiler.recordInvoke(String(command), (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
-            }
-            // Memoize task results once the Rust batch completes, so later
-            // assemblies over unchanged chat content skip the round trip.
-            if (command === REGEX_BATCH_COMMAND && regexCache) {
-                try {
-                    Promise.resolve(result).then((response) => {
-                        storeCachedRegexBatch(regexCache, args, response);
-                    }).catch(() => {
-                        // Failed batches are not cached.
-                    });
-                } catch {
-                    // Ignore non-thenable results.
-                }
-            }
-            return result;
+            }).catch(() => {
+                // Only silences the timing chain, not the caller's promise.
+            });
+
+            return returned;
         };
         profiledInvoke.__ttFteProfiled = true;
         broker.invoke = profiledInvoke;
