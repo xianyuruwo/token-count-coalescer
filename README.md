@@ -77,6 +77,7 @@ Chat Completion 的提示词组装按"每条消息一次请求"计数 token：`M
    ```js
    __TT_FRONTEND_TOKENIZER__.stats     // { intercepted, passedThrough, reasserted, ... }
    __TT_FRONTEND_TOKENIZER__.profile() // 性能剖析快照
+   __TT_FRONTEND_TOKENIZER__.clearRegexCache()  // 怀疑正则缓存陈旧时清空（内存+本地存储）
    __TT_FRONTEND_TOKENIZER__.enabled = false  // 临时关闭对比，刷新后生效
    ```
 

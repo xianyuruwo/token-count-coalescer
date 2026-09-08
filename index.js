@@ -62,7 +62,7 @@
 const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
 const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
 const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
-const EXTENSION_VERSION = '3.5.0';
+const EXTENSION_VERSION = '3.5.1';
 /** Invoke-broker commands whose counters reveal backend-side token counting. */
 const BACKEND_COUNT_COMMANDS = ['count_openai_tokens', 'count_openai_tokens_batch'];
 /** Profiler: report once a window accumulates this much busy time (ms). */
@@ -805,6 +805,12 @@ export function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 102
     /** @returns {[string, string][]} Entries in LRU order (oldest first). */
     const snapshotEntries = () => [...entries.entries()];
 
+    /** Empties the cache (memory only; callers decide about persistence). */
+    const clear = () => {
+        entries.clear();
+        chars = 0;
+    };
+
     /**
      * Persists the cache across page sessions. Loading happens synchronously
      * here; saves are debounced and flushed when the page hides, evicting the
@@ -888,7 +894,7 @@ export function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 102
         return { flush };
     };
 
-    return { keyOf, get, set, deleteKey, size: () => entries.size, snapshotEntries, attachPersistence };
+    return { keyOf, get, set, deleteKey, clear, size: () => entries.size, snapshotEntries, attachPersistence };
 }
 
 const REGEX_BATCH_COMMAND = 'apply_native_regex_batch';
@@ -1300,6 +1306,7 @@ function reassertInstrumentation(profiler) {
  * is keyed by task text + script definitions, so edits to messages or regex
  * scripts naturally invalidate themselves; a TauriTavern update that changes
  * regex semantics gets a fresh bucket via the version suffix.
+ * @returns {{ flush: () => void, clear: () => void } | null}
  */
 function installRegexCachePersistence(cache) {
     try {
@@ -1318,8 +1325,19 @@ function installRegexCachePersistence(cache) {
             save: (entries) => {
                 globalThis.localStorage.setItem(storageKey, JSON.stringify(entries));
             },
+            remove: () => {
+                globalThis.localStorage.removeItem(storageKey);
+            },
         };
         const { flush } = cache.attachPersistence(adapter);
+        const clear = () => {
+            try {
+                cache.clear();
+                adapter.remove?.();
+            } catch {
+                // Best-effort only.
+            }
+        };
         if (typeof window !== 'undefined') {
             window.addEventListener('pagehide', flush);
         }
@@ -1330,7 +1348,7 @@ function installRegexCachePersistence(cache) {
                 }
             });
         }
-        return flush;
+        return { flush, clear };
     } catch {
         // localStorage unavailable or corrupted: in-memory cache only.
         return null;
@@ -1349,7 +1367,11 @@ if (typeof globalThis.jQuery !== 'undefined') {
     observeLongTasks(profiler);
     // Attach persistence before instrumentation wraps setTimeout, so the
     // debounced flush uses the native timer and stays out of the profiler.
-    installRegexCachePersistence(REGEX_BATCH_CACHE);
+    const regexPersistence = installRegexCachePersistence(REGEX_BATCH_CACHE);
+    globalThis.__TT_FRONTEND_TOKENIZER__.clearRegexCache = () => {
+        REGEX_BATCH_CACHE.clear();
+        regexPersistence?.clear();
+    };
     reassertInstrumentation(profiler);
     installProbeButton(profiler);
     // Fast tick: re-assert the interceptor quickly when displaced, keep every
