@@ -62,7 +62,7 @@
 const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
 const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
 const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
-const EXTENSION_VERSION = '3.4.0';
+const EXTENSION_VERSION = '3.5.0';
 /** Invoke-broker commands whose counters reveal backend-side token counting. */
 const BACKEND_COUNT_COMMANDS = ['count_openai_tokens', 'count_openai_tokens_batch'];
 /** Profiler: report once a window accumulates this much busy time (ms). */
@@ -759,9 +759,11 @@ function hashString(input) {
  * results turns repeat batches into instant cache hits while preserving
  * exact semantics (cached values are real Rust outputs, never estimates).
  */
-function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 1024 * 1024) {
+export function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 1024 * 1024) {
     const entries = new Map();
     let chars = 0;
+    /** @type {{ schedule: () => void, flush: () => void } | null} Set by attachPersistence. */
+    let persistence = null;
 
     const keyOf = (task) => hashString(JSON.stringify(task));
 
@@ -775,23 +777,118 @@ function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 1024 * 102
         return undefined;
     };
 
+    const deleteKey = (key) => {
+        const existing = entries.get(key);
+        if (existing !== undefined) {
+            entries.delete(key);
+            chars -= existing.length;
+        }
+    };
+
     const set = (key, text) => {
         if (entries.has(key)) {
             entries.delete(key);
             entries.set(key, text);
-            return;
+        } else {
+            entries.set(key, text);
+            chars += text.length;
         }
-        entries.set(key, text);
-        chars += text.length;
         while ((entries.size > limitEntries || chars > limitChars) && entries.size > 0) {
             const oldestKey = entries.keys().next().value;
             const oldest = entries.get(oldestKey);
             entries.delete(oldestKey);
             chars -= oldest.length;
         }
+        persistence?.schedule();
     };
 
-    return { keyOf, get, set, size: () => entries.size };
+    /** @returns {[string, string][]} Entries in LRU order (oldest first). */
+    const snapshotEntries = () => [...entries.entries()];
+
+    /**
+     * Persists the cache across page sessions. Loading happens synchronously
+     * here; saves are debounced and flushed when the page hides, evicting the
+     * oldest entries when the storage quota or the byte budget is exceeded.
+     * @param {{
+     *   load: () => [string, string][] | null,
+     *   save: (entries: [string, string][]) => void,
+     *   debounceMs?: number,
+     *   autoSchedule?: boolean,
+     *   maxBytes?: number,
+     * }} adapter
+     * @returns {{ flush: () => void }}
+     */
+    const attachPersistence = (adapter) => {
+        const debounceMs = adapter.debounceMs ?? 1500;
+        const autoSchedule = adapter.autoSchedule !== false;
+        const maxBytes = adapter.maxBytes ?? 4 * 1024 * 1024;
+        // Capture before instrumentation wraps setTimeout, so the debounce
+        // timer is real wall-clock work and never shows up in the profiler.
+        const timerFn = globalThis.setTimeout;
+        let timer = null;
+
+        const loaded = adapter.load?.();
+        if (Array.isArray(loaded)) {
+            for (const [key, text] of loaded) {
+                if (typeof key === 'string' && typeof text === 'string') {
+                    // persistence is still null here, so set() does not schedule.
+                    set(key, text);
+                }
+            }
+        }
+
+        const flush = () => {
+            if (typeof adapter.save !== 'function') {
+                return;
+            }
+            let snapshot = snapshotEntries();
+            if (snapshot.length === 0) {
+                return;
+            }
+            // Keep the persisted payload within the byte budget.
+            while (snapshot.length > 0) {
+                const bytes = snapshot.reduce((total, [, text]) => total + text.length, 0);
+                if (bytes <= maxBytes) {
+                    break;
+                }
+                deleteKey(snapshot[0][0]);
+                snapshot = snapshotEntries();
+            }
+            try {
+                adapter.save(snapshot);
+            } catch {
+                // Storage full: drop a quarter of the oldest entries, retry once.
+                const drop = Math.max(1, Math.floor(snapshot.length / 4));
+                for (let i = 0; i < drop && snapshot.length > 0; i += 1) {
+                    deleteKey(snapshot[0][0]);
+                    snapshot = snapshotEntries();
+                }
+                try {
+                    adapter.save(snapshotEntries());
+                } catch {
+                    // Give up on persistence; in-memory cache keeps working.
+                }
+            }
+        };
+
+        const schedule = () => {
+            if (!autoSchedule) {
+                return;
+            }
+            if (timer !== null || typeof timerFn !== 'function') {
+                return;
+            }
+            timer = timerFn(() => {
+                timer = null;
+                flush();
+            }, debounceMs);
+        };
+
+        persistence = { schedule, flush };
+        return { flush };
+    };
+
+    return { keyOf, get, set, deleteKey, size: () => entries.size, snapshotEntries, attachPersistence };
 }
 
 const REGEX_BATCH_COMMAND = 'apply_native_regex_batch';
@@ -1196,6 +1293,50 @@ function reassertInstrumentation(profiler) {
     profileWaits(profiler);
 }
 
+/**
+ * Persists the native-regex batch cache in localStorage so repeat assemblies
+ * stay fast across page reloads (otherwise the first Rust batch after every
+ * app start costs 30-60s again). The key is versioned and every cache entry
+ * is keyed by task text + script definitions, so edits to messages or regex
+ * scripts naturally invalidate themselves; a TauriTavern update that changes
+ * regex semantics gets a fresh bucket via the version suffix.
+ */
+function installRegexCachePersistence(cache) {
+    try {
+        if (typeof globalThis.localStorage === 'undefined') {
+            return null;
+        }
+        const storageKey = `tt:fte:regexCache:${EXTENSION_VERSION}`;
+        const adapter = {
+            load: () => {
+                const raw = globalThis.localStorage.getItem(storageKey);
+                if (!raw) {
+                    return null;
+                }
+                return JSON.parse(raw);
+            },
+            save: (entries) => {
+                globalThis.localStorage.setItem(storageKey, JSON.stringify(entries));
+            },
+        };
+        const { flush } = cache.attachPersistence(adapter);
+        if (typeof window !== 'undefined') {
+            window.addEventListener('pagehide', flush);
+        }
+        if (typeof document !== 'undefined') {
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'hidden') {
+                    flush();
+                }
+            });
+        }
+        return flush;
+    } catch {
+        // localStorage unavailable or corrupted: in-memory cache only.
+        return null;
+    }
+}
+
 if (typeof globalThis.jQuery !== 'undefined') {
     installFrontendTokenizer(globalThis.jQuery);
     const guard = activateFrontendTokenizerGuard(() => globalThis.jQuery, { notify: showNotification });
@@ -1206,6 +1347,9 @@ if (typeof globalThis.jQuery !== 'undefined') {
     activeProfiler = profiler;
     globalThis.__TT_FRONTEND_TOKENIZER__.profile = () => profiler.snapshot();
     observeLongTasks(profiler);
+    // Attach persistence before instrumentation wraps setTimeout, so the
+    // debounced flush uses the native timer and stays out of the profiler.
+    installRegexCachePersistence(REGEX_BATCH_CACHE);
     reassertInstrumentation(profiler);
     installProbeButton(profiler);
     // Fast tick: re-assert the interceptor quickly when displaced, keep every
