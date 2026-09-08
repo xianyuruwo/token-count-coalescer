@@ -1,0 +1,10 @@
+{
+    "display_name": "Token Count Batch Coalescer",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "author": "TauriTavern Local",
+    "version": "1.0.0",
+    "homePage": ""
+}
