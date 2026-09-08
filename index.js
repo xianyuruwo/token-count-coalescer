@@ -39,6 +39,14 @@
  *     chat saves, etc. bypass the fetch patch because the Tauri runtime holds
  *     its own transport; each invoke is now timed by command name
  *   - IndexedDB reads/writes (localforage token cache / settings buckets)
+ * v3.2.0 closes the last ones:
+ *   - the host ABI's invoke broker (`__TAURITAVERN__.invoke.broker.invoke`):
+ *     patching `__TAURI__.core.invoke` can silently fail (the injected `core`
+ *     object may expose getters) or be bypassed by early-bound references,
+ *     while every `safeInvoke` in the app resolves `broker.invoke` dynamically
+ *     on a plain writable object — wrapping it catches all routed traffic
+ *   - long `setTimeout` delays and throttled `requestAnimationFrame` gaps,
+ *     which are pure waiting time invisible to every other meter
  * After a busy period it pops a summary toast ("TT 性能剖析") stating whether
  * the time was spent blocking the main thread, waiting on HTTP requests,
  * waiting on Tauri invokes (with per-command totals), or in IndexedDB.
@@ -54,7 +62,7 @@
 const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
 const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
 const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
-const EXTENSION_VERSION = '3.1.0';
+const EXTENSION_VERSION = '3.2.0';
 /** Invoke-broker commands whose counters reveal backend-side token counting. */
 const BACKEND_COUNT_COMMANDS = ['count_openai_tokens', 'count_openai_tokens_batch'];
 /** Profiler: report once a window accumulates this much busy time (ms). */
@@ -470,6 +478,11 @@ export function createProfiler(options = {}) {
             idbCount: 0,
             idbMs: 0,
             idbByOp: new Map(),
+            timerCount: 0,
+            timerMs: 0,
+            timerByDelay: new Map(),
+            rafCount: 0,
+            rafGapMs: 0,
         };
     }
 
@@ -537,6 +550,28 @@ export function createProfiler(options = {}) {
     }
 
     /**
+     * A scheduled timer finally fired after `ms` of requested delay.
+     * Pure waiting time (delays, backoff, polling) is invisible elsewhere.
+     * @param {number} scheduledMs
+     * @param {number} actualMs
+     */
+    function recordTimer(scheduledMs, actualMs) {
+        const w = windowState;
+        w.timerCount += 1;
+        w.timerMs += actualMs;
+        bumpEntry(w.timerByDelay, `${Math.round(scheduledMs)}ms`, actualMs);
+        noteActivity();
+    }
+
+    /** A requestAnimationFrame callback fired `gapMs` after scheduling. */
+    function recordRafGap(gapMs) {
+        const w = windowState;
+        w.rafCount += 1;
+        w.rafGapMs += gapMs;
+        noteActivity();
+    }
+
+    /**
      * @param {ReturnType<typeof emptyWindow>} w
      * @returns {string} Multi-line report using <br> for toastr.
      */
@@ -562,6 +597,12 @@ export function createProfiler(options = {}) {
         }
         if (w.idbCount > 0) {
             lines.push(`IndexedDB ${w.idbCount} 次，共 ${fmtSeconds(w.idbMs)}${w.idbByOp.size > 0 ? `（${topEntries(w.idbByOp, 2)}）` : ''}`);
+        }
+        if (w.timerCount > 0) {
+            lines.push(`定时器等待 ${w.timerCount} 次，共 ${fmtSeconds(w.timerMs)}${w.timerByDelay.size > 0 ? `（${topEntries(w.timerByDelay, 4)}）` : ''}`);
+        }
+        if (w.rafCount > 0) {
+            lines.push(`rAF 延迟 ${w.rafCount} 次，共 ${fmtSeconds(w.rafGapMs)}`);
         }
         lines.push(`本地估算 ${interceptedDelta} 次｜补丁恢复 ${reassertedDelta} 次｜后端计数 ${backendCountDelta()} 次`);
         return lines.join('<br>');
@@ -601,7 +642,8 @@ export function createProfiler(options = {}) {
         const heavy = busyMs >= PROFILE_AUTO_THRESHOLD_MS
             || w.ajaxMs >= PROFILE_AUTO_THRESHOLD_MS
             || w.invokeMs >= PROFILE_AUTO_THRESHOLD_MS
-            || w.idbMs >= PROFILE_AUTO_THRESHOLD_MS;
+            || w.idbMs >= PROFILE_AUTO_THRESHOLD_MS
+            || w.timerMs >= PROFILE_AUTO_THRESHOLD_MS;
         const quiet = lastActivityAt !== null && (t - lastActivityAt) >= PROFILE_QUIET_MS;
         const spaced = (t - lastReportAt) >= PROFILE_MIN_INTERVAL_MS;
 
@@ -630,10 +672,15 @@ export function createProfiler(options = {}) {
             idbCount: w.idbCount,
             idbMs: w.idbMs,
             idbByOp: [...w.idbByOp.entries()].map(([op, entry]) => ({ op, ...entry })),
+            timerCount: w.timerCount,
+            timerMs: w.timerMs,
+            timerByDelay: [...w.timerByDelay.entries()].map(([delay, entry]) => ({ delay, ...entry })),
+            rafCount: w.rafCount,
+            rafGapMs: w.rafGapMs,
         };
     }
 
-    return { tick, recordAjax, recordLongTask, recordInvoke, recordIdb, snapshot, reportNow };
+    return { tick, recordAjax, recordLongTask, recordInvoke, recordIdb, recordTimer, recordRafGap, snapshot, reportNow };
 }
 
 /** Starts observing main-thread long tasks (browser only, best-effort). */
@@ -683,14 +730,26 @@ function profileFetch(profiler) {
 }
 
 /**
- * Times every Tauri invoke by command name. The Tauri runtime keeps its own
- * transport (it does not go through the patched global fetch), so invokes are
- * otherwise invisible to the profiler — yet single invokes such as the native
- * regex batch or a chat save can hold the prompt pipeline for seconds.
- * `tauri-bridge.js` resolves `window.__TAURI__.core.invoke` on every call, so
- * replacing the property intercepts every caller.
+ * Shared instrumentation state so the broker-level and transport-level
+ * wrappers do not double-count the same invoke call.
  */
-export function profileTauriInvoke(profiler, tauriLike = globalThis.__TAURI__) {
+const INVOKE_INSTRUMENTATION = { insideBroker: false };
+
+/**
+ * Times every Tauri invoke by command name, from the transport level.
+ * The Tauri runtime keeps its own transport (it does not go through the
+ * patched global fetch), so invokes are otherwise invisible to the profiler —
+ * yet single invokes such as the native regex batch or a chat save can hold
+ * the prompt pipeline for seconds. `tauri-bridge.js` resolves
+ * `window.__TAURI__.core.invoke` on every call, so replacing the property
+ * intercepts every transport-level caller.
+ *
+ * When the broker wrapper (`profileInvokeBroker`) is also installed, calls
+ * that reach this wrapper through the broker are counted there, so here they
+ * are recorded under a `direct:` label only when the broker did not originate
+ * them (e.g. broker calls that sat on a concurrency-limiter queue).
+ */
+export function profileTauriInvoke(profiler, tauriLike = globalThis.__TAURI__, shared = INVOKE_INSTRUMENTATION) {
     try {
         const core = tauriLike?.core;
         if (!core || typeof core.invoke !== 'function' || core.invoke.__ttFteProfiled) {
@@ -699,8 +758,71 @@ export function profileTauriInvoke(profiler, tauriLike = globalThis.__TAURI__) {
 
         const originalInvoke = core.invoke;
         const profiledInvoke = function (command, ...rest) {
+            // Snapshot at call time: the broker wrapper clears its flag as soon
+            // as `broker.invoke` returns, which happens before this promise
+            // settles. Calls that run inside the broker's synchronous section
+            // are already counted end-to-end by the broker wrapper (including
+            // any limiter-queue wait), so suppress them here to avoid
+            // double-counting. Only transport calls that escape the broker
+            // section (e.g. queued behind a concurrency limiter) are recorded
+            // here, under a `direct:` label.
+            const suppressed = shared.insideBroker;
             const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
             const result = originalInvoke.apply(this, [command, ...rest]);
+            if (suppressed) {
+                return result;
+            }
+            const label = `direct:${command}`;
+            const record = (ms) => profiler.recordInvoke(label, ms);
+            try {
+                Promise.resolve(result).finally(() => {
+                    record((typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+                }).catch(() => {
+                    // Only silences the timing chain, not the caller's promise.
+                });
+            } catch {
+                record((typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+            }
+            return result;
+        };
+        profiledInvoke.__ttFteProfiled = true;
+        try {
+            core.invoke = profiledInvoke;
+        } catch {
+            // Injected `core` may expose read-only accessors (e.g. getter-only
+            // `invoke`); the broker wrapper below still covers routed traffic.
+            return false;
+        }
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Times every routed Tauri invoke at the host ABI's invoke-broker boundary.
+ * Every `safeInvoke` in the app (route handlers, native regex batch, chat
+ * saves, ...) resolves `invokeBroker.invoke` dynamically on the plain object
+ * exposed as `__TAURITAVERN__.invoke.broker`, so replacing that method is the
+ * most reliable single choke point and survives read-only `__TAURI__` cores.
+ */
+export function profileInvokeBroker(profiler, abiLike = globalThis.__TAURITAVERN__, shared = INVOKE_INSTRUMENTATION) {
+    try {
+        const broker = abiLike?.invoke?.broker;
+        if (!broker || typeof broker.invoke !== 'function' || broker.invoke.__ttFteProfiled) {
+            return false;
+        }
+
+        const originalInvoke = broker.invoke;
+        const profiledInvoke = function (command, args) {
+            const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+            shared.insideBroker = true;
+            let result;
+            try {
+                result = originalInvoke.call(broker, command, args);
+            } finally {
+                shared.insideBroker = false;
+            }
             try {
                 Promise.resolve(result).finally(() => {
                     profiler.recordInvoke(String(command), (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
@@ -713,11 +835,80 @@ export function profileTauriInvoke(profiler, tauriLike = globalThis.__TAURI__) {
             return result;
         };
         profiledInvoke.__ttFteProfiled = true;
-        core.invoke = profiledInvoke;
+        broker.invoke = profiledInvoke;
         return true;
     } catch {
         return false;
     }
+}
+
+/**
+ * Records long `setTimeout` waits and throttled `requestAnimationFrame` gaps.
+ * Both are pure waiting time that no other meter sees: main-thread idle,
+ * no requests, no invokes, no IndexedDB. A 30-second assembly made of
+ * `await delay(...)` chains or rAF-throttled UI updates would show up here.
+ */
+export function profileWaits(profiler, globalObject = globalThis) {
+    let changed = false;
+
+    try {
+        const originalSetTimeout = globalObject.setTimeout;
+        if (typeof originalSetTimeout === 'function' && !originalSetTimeout.__ttFteProfiled) {
+            const MIN_DELAY_MS = 500;
+            const profiledSetTimeout = function (fn, delay = 0, ...rest) {
+                const delayMs = Number(delay) || 0;
+                const scheduledAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+                if (delayMs >= MIN_DELAY_MS) {
+                    const wrapped = function (...args) {
+                        try {
+                            return typeof fn === 'function' ? fn.apply(this, args) : fn;
+                        } finally {
+                            profiler.recordTimer(delayMs, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - scheduledAt);
+                        }
+                    };
+                    return originalSetTimeout.call(this, wrapped, delay, ...rest);
+                }
+                return originalSetTimeout.call(this, fn, delay, ...rest);
+            };
+            profiledSetTimeout.__ttFteProfiled = true;
+            try {
+                globalObject.setTimeout = profiledSetTimeout;
+                changed = true;
+            } catch {
+                // Non-writable binding: skip.
+            }
+        }
+    } catch {
+        // Best-effort only.
+    }
+
+    try {
+        const originalRaf = globalObject.requestAnimationFrame;
+        if (typeof originalRaf === 'function' && !originalRaf.__ttFteProfiled) {
+            const MIN_GAP_MS = 100;
+            const profiledRaf = function (callback) {
+                const scheduledAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+                return originalRaf.call(this, (timestamp) => {
+                    const gap = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - scheduledAt;
+                    if (gap >= MIN_GAP_MS) {
+                        profiler.recordRafGap(gap);
+                    }
+                    return callback(timestamp);
+                });
+            };
+            profiledRaf.__ttFteProfiled = true;
+            try {
+                globalObject.requestAnimationFrame = profiledRaf;
+                changed = true;
+            } catch {
+                // Non-writable binding: skip.
+            }
+        }
+    } catch {
+        // Best-effort only.
+    }
+
+    return changed;
 }
 
 /**
@@ -812,6 +1003,21 @@ function installProbeButton(profiler) {
     }
 }
 
+/**
+ * Idempotently (re)asserts every instrumentation patch. The host and other
+ * extensions replace global bindings during startup, and on mobile the Tauri
+ * ABI (`__TAURI__`, `__TAURITAVERN__`) may be injected after this module runs,
+ * so the watchdog re-runs this on every tick. Each install checks its own
+ * marker and is a no-op when already in place.
+ */
+function reassertInstrumentation(profiler) {
+    profileFetch(profiler);
+    profileTauriInvoke(profiler);
+    profileInvokeBroker(profiler);
+    profileIndexedDb(profiler);
+    profileWaits(profiler);
+}
+
 if (typeof globalThis.jQuery !== 'undefined') {
     installFrontendTokenizer(globalThis.jQuery);
     const guard = activateFrontendTokenizerGuard(() => globalThis.jQuery, { notify: showNotification });
@@ -822,14 +1028,13 @@ if (typeof globalThis.jQuery !== 'undefined') {
     activeProfiler = profiler;
     globalThis.__TT_FRONTEND_TOKENIZER__.profile = () => profiler.snapshot();
     observeLongTasks(profiler);
-    profileFetch(profiler);
-    profileTauriInvoke(profiler);
-    profileIndexedDb(profiler);
+    reassertInstrumentation(profiler);
     installProbeButton(profiler);
-    // Fast tick: re-assert the interceptor quickly when displaced and drive
-    // the profiler window checks.
+    // Fast tick: re-assert the interceptor quickly when displaced, keep every
+    // instrumentation patch outermost, and drive the profiler window checks.
     const guardTimer = setInterval(() => {
         guard.tick();
+        reassertInstrumentation(profiler);
         profiler.tick();
     }, PROFILE_TICK_MS);
     // Do not keep Node test contexts alive on account of the watchdog.
