@@ -62,7 +62,7 @@
 const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
 const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
 const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
-const EXTENSION_VERSION = '3.2.0';
+const EXTENSION_VERSION = '3.3.0';
 /** Invoke-broker commands whose counters reveal backend-side token counting. */
 const BACKEND_COUNT_COMMANDS = ['count_openai_tokens', 'count_openai_tokens_batch'];
 /** Profiler: report once a window accumulates this much busy time (ms). */
@@ -460,6 +460,7 @@ export function createProfiler(options = {}) {
     let lastReportAt = -Infinity;
     let lastSeenIntercepted = 0;
     let lastSeenReasserted = 0;
+    let lastSeenRegexCacheHits = 0;
 
     function emptyWindow() {
         return {
@@ -580,6 +581,7 @@ export function createProfiler(options = {}) {
             ?? { intercepted: 0, passedThrough: 0, reasserted: 0 };
         const interceptedDelta = (stats.intercepted || 0) - lastSeenIntercepted;
         const reassertedDelta = (stats.reasserted || 0) - lastSeenReasserted;
+        const regexCacheHitsDelta = (stats.regexCacheHits || 0) - lastSeenRegexCacheHits;
         const elapsedMs = Date.now() - w.startedAt;
         const busyMs = Math.max(w.longTaskMs, w.driftMs);
 
@@ -605,6 +607,9 @@ export function createProfiler(options = {}) {
             lines.push(`rAF 延迟 ${w.rafCount} 次，共 ${fmtSeconds(w.rafGapMs)}`);
         }
         lines.push(`本地估算 ${interceptedDelta} 次｜补丁恢复 ${reassertedDelta} 次｜后端计数 ${backendCountDelta()} 次`);
+        if (regexCacheHitsDelta > 0) {
+            lines.push(`正则批处理缓存命中 ${regexCacheHitsDelta} 次（跳过 Rust 调用）`);
+        }
         return lines.join('<br>');
     }
 
@@ -613,6 +618,7 @@ export function createProfiler(options = {}) {
         if (stats) {
             lastSeenIntercepted = stats.intercepted || 0;
             lastSeenReasserted = stats.reasserted || 0;
+            lastSeenRegexCacheHits = stats.regexCacheHits || 0;
         }
         windowState = emptyWindow();
     }
@@ -729,11 +735,104 @@ function profileFetch(profiler) {
     }
 }
 
-/**
- * Shared instrumentation state so the broker-level and transport-level
- * wrappers do not double-count the same invoke call.
- */
+/** Shared instrumentation state so the broker-level and transport-level
+ * wrappers do not double-count the same invoke call. */
 const INVOKE_INSTRUMENTATION = { insideBroker: false };
+
+/** FNV-1a 32-bit hash (stable across sessions). */
+function hashString(input) {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < input.length; i += 1) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(36);
+}
+
+/**
+ * LRU cache for native-regex batch results.
+ *
+ * `apply_native_regex_batch` output is a pure function of each task's text and
+ * its (depth-filtered) script list: identical input always yields identical
+ * output. Prompt assembly re-runs the whole batch on unchanged chat content on
+ * every generation (retries, viewer re-opens, regenerations), so memoizing
+ * results turns repeat batches into instant cache hits while preserving
+ * exact semantics (cached values are real Rust outputs, never estimates).
+ */
+function createRegexBatchCache(limitEntries = 4000, limitChars = 16 * 1024 * 1024) {
+    const entries = new Map();
+    let chars = 0;
+
+    const keyOf = (task) => hashString(JSON.stringify(task));
+
+    const get = (key) => {
+        const value = entries.get(key);
+        if (value !== undefined) {
+            entries.delete(key);
+            entries.set(key, value);
+            return value;
+        }
+        return undefined;
+    };
+
+    const set = (key, text) => {
+        if (entries.has(key)) {
+            entries.delete(key);
+            entries.set(key, text);
+            return;
+        }
+        entries.set(key, text);
+        chars += text.length;
+        while ((entries.size > limitEntries || chars > limitChars) && entries.size > 0) {
+            const oldestKey = entries.keys().next().value;
+            const oldest = entries.get(oldestKey);
+            entries.delete(oldestKey);
+            chars -= oldest.length;
+        }
+    };
+
+    return { keyOf, get, set, size: () => entries.size };
+}
+
+const REGEX_BATCH_COMMAND = 'apply_native_regex_batch';
+const REGEX_BATCH_CACHE = createRegexBatchCache();
+
+/**
+ * All-or-nothing memoized response for a native-regex batch call.
+ * @param {ReturnType<typeof createRegexBatchCache>} cache
+ * @param {any} args
+ * @returns {{ tasks: { text: string }[] } | null} Cached response or null.
+ */
+function tryServeCachedRegexBatch(cache, args) {
+    const tasks = args?.dto?.tasks;
+    if (!Array.isArray(tasks) || tasks.length === 0) {
+        return null;
+    }
+    const texts = new Array(tasks.length);
+    for (let i = 0; i < tasks.length; i += 1) {
+        const cached = cache.get(cache.keyOf(tasks[i]));
+        if (cached === undefined) {
+            return null;
+        }
+        texts[i] = cached;
+    }
+    return { tasks: texts.map((text) => ({ text })) };
+}
+
+/** Stores every task result of a completed batch for future calls. */
+function storeCachedRegexBatch(cache, args, response) {
+    const tasks = args?.dto?.tasks;
+    const results = response?.tasks;
+    if (!Array.isArray(tasks) || !Array.isArray(results) || tasks.length !== results.length) {
+        return;
+    }
+    for (let i = 0; i < tasks.length; i += 1) {
+        const text = results[i]?.text;
+        if (typeof text === 'string') {
+            cache.set(cache.keyOf(tasks[i]), text);
+        }
+    }
+}
 
 /**
  * Times every Tauri invoke by command name, from the transport level.
@@ -800,13 +899,14 @@ export function profileTauriInvoke(profiler, tauriLike = globalThis.__TAURI__, s
 }
 
 /**
- * Times every routed Tauri invoke at the host ABI's invoke-broker boundary.
+ * Times every routed Tauri invoke at the host ABI's invoke-broker boundary,
+ * and memoizes native-regex batch results (see `createRegexBatchCache`).
  * Every `safeInvoke` in the app (route handlers, native regex batch, chat
  * saves, ...) resolves `invokeBroker.invoke` dynamically on the plain object
  * exposed as `__TAURITAVERN__.invoke.broker`, so replacing that method is the
  * most reliable single choke point and survives read-only `__TAURI__` cores.
  */
-export function profileInvokeBroker(profiler, abiLike = globalThis.__TAURITAVERN__, shared = INVOKE_INSTRUMENTATION) {
+export function profileInvokeBroker(profiler, abiLike = globalThis.__TAURITAVERN__, shared = INVOKE_INSTRUMENTATION, regexCache = REGEX_BATCH_CACHE) {
     try {
         const broker = abiLike?.invoke?.broker;
         if (!broker || typeof broker.invoke !== 'function' || broker.invoke.__ttFteProfiled) {
@@ -815,6 +915,18 @@ export function profileInvokeBroker(profiler, abiLike = globalThis.__TAURITAVERN
 
         const originalInvoke = broker.invoke;
         const profiledInvoke = function (command, args) {
+            // Whole-batch regex cache hit: answer locally, no Rust round trip.
+            if (command === REGEX_BATCH_COMMAND && regexCache) {
+                const cached = tryServeCachedRegexBatch(regexCache, args);
+                if (cached) {
+                    const stats = globalThis.__TT_FRONTEND_TOKENIZER__?.stats;
+                    if (stats) {
+                        stats.regexCacheHits = (stats.regexCacheHits || 0) + 1;
+                    }
+                    return Promise.resolve(cached);
+                }
+            }
+
             const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
             shared.insideBroker = true;
             let result;
@@ -831,6 +943,19 @@ export function profileInvokeBroker(profiler, abiLike = globalThis.__TAURITAVERN
                 });
             } catch {
                 profiler.recordInvoke(String(command), (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+            }
+            // Memoize task results once the Rust batch completes, so later
+            // assemblies over unchanged chat content skip the round trip.
+            if (command === REGEX_BATCH_COMMAND && regexCache) {
+                try {
+                    Promise.resolve(result).then((response) => {
+                        storeCachedRegexBatch(regexCache, args, response);
+                    }).catch(() => {
+                        // Failed batches are not cached.
+                    });
+                } catch {
+                    // Ignore non-thenable results.
+                }
             }
             return result;
         };
