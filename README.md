@@ -1,12 +1,25 @@
 # Frontend Token Estimator (TauriTavern 扩展)
 
-灵感来自 [ST-Frontend-Tokenizer](https://github.com/GoldenglowMeow/ST-Frontend-Tokenizer)（MIT），针对 TauriTavern 的端点契约做了适配与修正。
+灵感来自 [ST-Frontend-Tokenizer](https://github.com/GoldenglowMeow/ST-Frontend-Tokenizer)（MIT），针对 TauriTavern 的端点契约做了适配与修正。v3.0.0 起内置性能剖析器，用于定位提示词组装慢的真正瓶颈。
 
 ## 解决什么问题
 
 Chat Completion 的提示词组装按"每条消息一次请求"计数 token：`Message.createAsync` / `setName` 各自发一次 `POST /api/tokenizers/openai/count-batch`，由宿主通过串行化的 Tauri invoke 执行。300 楼的聊天意味着数百次串行 IPC 往返（约 20 秒）。
 
 本扩展在运行时补丁 `jQuery.ajax`，直接在前端估算并立即返回结果——**零网络往返**，计数瞬间完成。
+
+## 性能剖析器（v3.0.0）
+
+实测发现"组装慢"未必是 token 计数导致。扩展会持续测量：
+
+- **主线程繁忙**：长任务（PerformanceObserver）+ 计时器漂移（累计 <50ms 的阻塞）
+- **后端请求**：所有经 ajax/fetch 通往宿主的请求次数与耗时（含最耗时端点排行）
+- **计数器**：本地估算 / 补丁恢复 / 后端真实计数次数
+
+一次繁忙期结束（安静 3 秒）后自动弹 toast「TT 性能剖析」。右侧浮动 **Σ** 按钮可随时手动查看（双击隐藏）。判读方法：
+
+- 主线程繁忙占大头 → 瓶颈是 JS 计算（渲染、正则、世界信息扫描、其他扩展的逐楼处理）
+- 后端请求耗时占大头 → 瓶颈是 IPC（看最耗时端点名定位具体命令）
 
 ## 工作方式
 
@@ -18,6 +31,7 @@ Chat Completion 的提示词组装按"每条消息一次请求"计数 token：`M
   - `encode` / `decode`：logit bias 等功能需要真实 token id
   - 空数组（预热）、非 POST、无法解析的请求体
 - 兼容废弃的 `async: false` 同步调用路径（同步触发 success 回调）
+- **看门狗**：宿主启动或其他扩展（如酒馆助手）可能替换 jQuery.ajax 埋掉拦截层；看门狗每 300ms 检查，被覆盖时自动恢复（覆盖者身份记录在控制台）
 
 相比参考项目，本扩展修正了两个问题：`count-batch` 直接返回 `token_counts` 数组（参考项目靠 legacy 回退绕行）；不拦截 encode/decode（参考项目返回空 `ids`，会破坏 logit bias）。
 
@@ -35,16 +49,13 @@ Chat Completion 的提示词组装按"每条消息一次请求"计数 token：`M
 
 ## 验证是否生效
 
-1. **启动通知**：加载成功时弹 toast「前端 Token 估算已启用（v2.3.0）」
-2. **看门狗**：宿主启动或其他扩展（如酒馆助手）可能替换 jQuery.ajax，把本扩展的拦截层埋到底下。看门狗每 300ms 检查一次，被覆盖时自动恢复并弹 toast「检测到 jQuery.ajax 补丁被覆盖，已自动恢复拦截」（覆盖者身份会记录在控制台）
-3. **诊断 toast**（关键判据）：首次大量计数发生后弹一次性 toast，三种结果：
-   - 「拦截生效：已本地估算 N 次，后端计数 0 次」→ 正常工作
-   - 「部分生效：本地估算 N 次，后端仍在计数 M 次」→ 部分绕过
-   - 「拦截未生效：后端已计数 M 次，本地估算 0 次」→ 完全绕过
-4. **速度**：切换到另一个模型再切回（使 token 缓存失效）后在长聊天中生成
-5. **运行时统计**（桌面端 F12 控制台）：
+1. **启动通知**：加载成功时弹 toast「前端 Token 估算已启用（v3.0.0）」
+2. **诊断 toast**：首次大量计数后一次性报告拦截状态（拦截生效 / 部分生效 / 拦截未生效）
+3. **性能剖析**：慢操作结束后自动弹「TT 性能剖析」，点 Σ 按钮随时重看
+4. **运行时统计**（桌面端 F12 控制台）：
    ```js
-   __TT_FRONTEND_TOKENIZER__.stats   // { intercepted, passedThrough, reasserted, ... }
+   __TT_FRONTEND_TOKENIZER__.stats     // { intercepted, passedThrough, reasserted, ... }
+   __TT_FRONTEND_TOKENIZER__.profile() // 性能剖析快照
    __TT_FRONTEND_TOKENIZER__.enabled = false  // 临时关闭对比，刷新后生效
    ```
 
@@ -55,3 +66,4 @@ Chat Completion 的提示词组装按"每条消息一次请求"计数 token：`M
 ## 许可
 
 MIT
+

@@ -26,26 +26,45 @@
  * - empty-array requests (tokenizer warm-up), non-POST requests, and bodies
  *   that do not parse as an array
  *
- * The host bootstrap also patches `jQuery.ajax` (and re-applies its patch
- * after backend readiness, explicitly to undo third-party replacements), so
- * this extension installs a watchdog that re-asserts its interceptor whenever
- * it gets displaced, plus a one-shot diagnostic notification that reports
- * whether counting is really being answered locally:
- *   - "拦截生效"     -> estimates served locally, backend saw zero counts
- *   - "部分生效"     -> both local estimates and backend counts happened
- *   - "拦截未生效"   -> all counting still reaches the backend
+ * The host bootstrap (and possibly sibling extensions) re-apply their own
+ * `jQuery.ajax` patch after this extension loads, burying the interceptor.
+ * A watchdog re-asserts it whenever displaced.
+ *
+ * Performance profiler (v3.0.0): because slow prompt assembly is not always
+ * caused by token counting, the extension also measures where page time goes:
+ *   - main-thread long tasks (PerformanceObserver) and timer drift
+ *   - wall time of every ajax/fetch request passed through to the host
+ * After a busy period it pops a summary toast ("TT 性能剖析") stating whether
+ * the time was spent blocking the main thread (rendering / regex / extension
+ * scripts) or waiting on backend requests, plus estimator/guard counters.
+ * A small floating "Σ" button re-shows the report on demand
+ * (double-tap hides it).
  *
  * Runtime controls (desktop console):
- *   __TT_FRONTEND_TOKENIZER__.enabled = false  // disable, then reload
+ *   __TT_FRONTEND_TOKENIZER__.enabled = false  // disable estimator, reload
  *   __TT_FRONTEND_TOKENIZER__.stats             // { intercepted, passedThrough, reasserted, ... }
+ *   __TT_FRONTEND_TOKENIZER__.profile()         // profiler snapshot object
  */
 
 const COUNT_ENDPOINT = '/api/tokenizers/openai/count';
 const BATCH_ENDPOINT = '/api/tokenizers/openai/count-batch';
 const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
-const EXTENSION_VERSION = '2.3.0';
+const EXTENSION_VERSION = '3.0.0';
 /** Invoke-broker commands whose counters reveal backend-side token counting. */
 const BACKEND_COUNT_COMMANDS = ['count_openai_tokens', 'count_openai_tokens_batch'];
+/** Profiler: report once a window accumulates this much busy time (ms). */
+const PROFILE_AUTO_THRESHOLD_MS = 2_000;
+/** Profiler: report only after activity has been quiet for this long (ms). */
+const PROFILE_QUIET_MS = 3_000;
+/** Profiler: minimum spacing between automatic reports (ms). */
+const PROFILE_MIN_INTERVAL_MS = 30_000;
+/** Profiler: watchdog tick interval (ms); also drives the drift meter. */
+const PROFILE_TICK_MS = 300;
+/** Profiler: timer lateness below this is treated as jitter, not blocking. */
+const PROFILE_DRIFT_MIN_MS = 100;
+
+/** @type {{ recordAjax: (path: string, ms: number) => void } | null} Set by page init. */
+let activeProfiler = null;
 
 /** Character-level token estimate, identical to the host's fallback heuristic. */
 function estimateTextTokens(text) {
@@ -103,15 +122,21 @@ function estimateMessageRequest(messages) {
     return total;
 }
 
+/** Request path without query/hash, for endpoint labels. */
+function requestPathOf(url) {
+    return String(url || '').split('?')[0].split('#')[0];
+}
+
 /**
  * Best-effort user-visible notification.
  * @param {string} message
+ * @param {number} [timeOut]
  */
-function showNotification(message) {
+function showNotification(message, timeOut = 10_000) {
     try {
         const toastr = globalThis.toastr;
         if (toastr && typeof toastr.info === 'function') {
-            toastr.info(message, 'Frontend Token Estimator', { timeOut: 10_000 });
+            toastr.info(message, 'Frontend Token Estimator', { timeOut, escapeHtml: false });
         }
     } catch {
         // Best-effort only.
@@ -169,7 +194,7 @@ export function installFrontendTokenizer(jQueryLike) {
      */
     function tryIntercept(settings) {
         // Exact-path matching so sibling endpoints (count-prefix-batch) never match.
-        const path = String(settings.url || '').split('?')[0].split('#')[0];
+        const path = requestPathOf(settings.url);
         let batch = false;
         if (path === BATCH_ENDPOINT) {
             batch = true;
@@ -233,7 +258,32 @@ export function installFrontendTokenizer(jQueryLike) {
         }
 
         stats.passedThrough += 1;
-        return originalAjax.apply(this, arguments);
+        const path = requestPathOf(settings?.url);
+        const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        const elapsed = () => Math.max(0, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+        let result;
+        try {
+            result = originalAjax.apply(this, arguments);
+        } catch (error) {
+            activeProfiler?.recordAjax(path, elapsed());
+            throw error;
+        }
+        if (activeProfiler) {
+            try {
+                // jqXHR and promises settle later; measure until then. For
+                // sync (async:false) XHRs the deferred is already resolved,
+                // so the timing is equally accurate on the microtask.
+                Promise.resolve(result).finally(() => {
+                    activeProfiler?.recordAjax(path, elapsed());
+                }).catch(() => {
+                    // Only silences the timing chain, not the caller's promise.
+                });
+            } catch {
+                // Non-thenable result: record synchronously.
+                activeProfiler.recordAjax(path, elapsed());
+            }
+        }
+        return result;
     };
     patchedAjax.__ttFrontendTokenizer = true;
     jQueryLike.ajax = patchedAjax;
@@ -358,12 +408,280 @@ export function activateFrontendTokenizerGuard(getJQuery, { notify = () => {}, t
     return { tick, backendCountDelta };
 }
 
+/** @param {number} ms */
+function fmtSeconds(ms) {
+    return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/**
+ * Measures where page time goes during slow operations so the actual
+ * bottleneck can be identified without dev tools.
+ *
+ * @param {{
+ *   notify?: (message: string) => void,
+ *   backendCountDelta?: () => number,
+ *   now?: () => number,
+ *   isHidden?: () => boolean,
+ *   tickMs?: number,
+ * }} [options]
+ * @returns {{
+ *   tick: () => void,
+ *   recordAjax: (path: string, ms: number) => void,
+ *   recordLongTask: (ms: number) => void,
+ *   snapshot: () => object,
+ *   reportNow: () => string,
+ * }}
+ */
+export function createProfiler(options = {}) {
+    const notify = options.notify ?? (() => {});
+    const backendCountDelta = options.backendCountDelta ?? (() => 0);
+    const now = options.now ?? (() => (typeof performance !== 'undefined' ? performance.now() : Date.now()));
+    const isHidden = options.isHidden ?? (() => typeof document !== 'undefined' && document.hidden);
+    const tickMs = options.tickMs ?? PROFILE_TICK_MS;
+
+    let windowState = emptyWindow();
+    let lastTickAt = null;
+    let lastActivityAt = null;
+    let lastReportAt = -Infinity;
+    let lastSeenIntercepted = 0;
+    let lastSeenReasserted = 0;
+
+    function emptyWindow() {
+        return {
+            startedAt: Date.now(),
+            longTaskMs: 0,
+            longTaskCount: 0,
+            maxLongTaskMs: 0,
+            driftMs: 0,
+            ajaxCount: 0,
+            ajaxMs: 0,
+            ajaxMaxMs: 0,
+            ajaxByPath: new Map(),
+        };
+    }
+
+    function noteActivity() {
+        lastActivityAt = now();
+    }
+
+    function recordAjax(path, ms) {
+        const w = windowState;
+        w.ajaxCount += 1;
+        w.ajaxMs += ms;
+        w.ajaxMaxMs = Math.max(w.ajaxMaxMs, ms);
+        const entry = w.ajaxByPath.get(path) ?? { count: 0, ms: 0 };
+        entry.count += 1;
+        entry.ms += ms;
+        w.ajaxByPath.set(path, entry);
+        noteActivity();
+    }
+
+    function recordLongTask(ms) {
+        const w = windowState;
+        w.longTaskMs += ms;
+        w.longTaskCount += 1;
+        w.maxLongTaskMs = Math.max(w.maxLongTaskMs, ms);
+        noteActivity();
+    }
+
+    /**
+     * @param {ReturnType<typeof emptyWindow>} w
+     * @returns {string} Multi-line report using <br> for toastr.
+     */
+    function buildReport(w) {
+        const stats = globalThis.__TT_FRONTEND_TOKENIZER__?.stats
+            ?? { intercepted: 0, passedThrough: 0, reasserted: 0 };
+        const interceptedDelta = (stats.intercepted || 0) - lastSeenIntercepted;
+        const reassertedDelta = (stats.reasserted || 0) - lastSeenReasserted;
+        const elapsedMs = Date.now() - w.startedAt;
+        const busyMs = Math.max(w.longTaskMs, w.driftMs);
+        const slowestPaths = [...w.ajaxByPath.entries()]
+            .sort((a, b) => b[1].ms - a[1].ms)
+            .slice(0, 3)
+            .map(([path, entry]) => `${path} ×${entry.count} (${fmtSeconds(entry.ms)})`)
+            .join('、');
+
+        const lines = [
+            `TT 性能剖析（最近 ${(elapsedMs / 1000).toFixed(1)}s）：`,
+            `主线程繁忙 ${fmtSeconds(busyMs)}（长任务 ${fmtSeconds(w.longTaskMs)}/${w.longTaskCount} 次，最大 ${fmtSeconds(w.maxLongTaskMs)}；计时漂移 ${fmtSeconds(w.driftMs)}）`,
+            `后端请求 ${w.ajaxCount} 次，共 ${fmtSeconds(w.ajaxMs)}（最慢单次 ${fmtSeconds(w.ajaxMaxMs)}）`,
+        ];
+        if (slowestPaths) {
+            lines.push(`最耗时请求：${slowestPaths}`);
+        }
+        lines.push(`本地估算 ${interceptedDelta} 次｜补丁恢复 ${reassertedDelta} 次｜后端计数 ${backendCountDelta()} 次`);
+        return lines.join('<br>');
+    }
+
+    function resetWindow() {
+        const stats = globalThis.__TT_FRONTEND_TOKENIZER__?.stats;
+        if (stats) {
+            lastSeenIntercepted = stats.intercepted || 0;
+            lastSeenReasserted = stats.reasserted || 0;
+        }
+        windowState = emptyWindow();
+    }
+
+    function reportNow() {
+        const message = buildReport(windowState);
+        notify(message);
+        return message;
+    }
+
+    function tick() {
+        const t = now();
+
+        // Timer lateness approximates main-thread blocking that individual
+        // long tasks below the 50ms threshold still cause in aggregate.
+        if (lastTickAt !== null) {
+            const lateness = t - lastTickAt - tickMs;
+            if (lateness >= PROFILE_DRIFT_MIN_MS && !isHidden()) {
+                windowState.driftMs += lateness;
+                noteActivity();
+            }
+        }
+        lastTickAt = t;
+
+        const w = windowState;
+        const busyMs = Math.max(w.longTaskMs, w.driftMs);
+        const heavy = busyMs >= PROFILE_AUTO_THRESHOLD_MS || w.ajaxMs >= PROFILE_AUTO_THRESHOLD_MS;
+        const quiet = lastActivityAt !== null && (t - lastActivityAt) >= PROFILE_QUIET_MS;
+        const spaced = (t - lastReportAt) >= PROFILE_MIN_INTERVAL_MS;
+
+        if (heavy && quiet && spaced) {
+            lastReportAt = t;
+            reportNow();
+            resetWindow();
+        }
+    }
+
+    function snapshot() {
+        const w = windowState;
+        return {
+            windowStartedAt: w.startedAt,
+            longTaskMs: w.longTaskMs,
+            longTaskCount: w.longTaskCount,
+            maxLongTaskMs: w.maxLongTaskMs,
+            driftMs: w.driftMs,
+            ajaxCount: w.ajaxCount,
+            ajaxMs: w.ajaxMs,
+            ajaxMaxMs: w.ajaxMaxMs,
+            ajaxByPath: [...w.ajaxByPath.entries()].map(([path, entry]) => ({ path, ...entry })),
+        };
+    }
+
+    return { tick, recordAjax, recordLongTask, snapshot, reportNow };
+}
+
+/** Starts observing main-thread long tasks (browser only, best-effort). */
+function observeLongTasks(profiler) {
+    try {
+        if (typeof PerformanceObserver === 'undefined') {
+            return;
+        }
+        const observer = new PerformanceObserver((list) => {
+            for (const entry of list.getEntries()) {
+                profiler.recordLongTask(entry.duration || 0);
+            }
+        });
+        observer.observe({ entryTypes: ['longtask'] });
+    } catch {
+        // Long Task API unavailable: the drift meter in tick() still works.
+    }
+}
+
+/** Times fetch() calls the same way ajax pass-throughs are timed. */
+function profileFetch(profiler) {
+    try {
+        const originalFetch = globalThis.fetch;
+        if (typeof originalFetch !== 'function' || originalFetch.__ttFteProfiled) {
+            return;
+        }
+        const profiledFetch = function (input, init) {
+            const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+            let path = '';
+            try {
+                path = requestPathOf(typeof input === 'string' ? input : input?.url);
+            } catch {
+                path = 'fetch';
+            }
+            const promise = originalFetch.apply(this, arguments);
+            promise.then(
+                () => profiler.recordAjax(path, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt),
+                () => profiler.recordAjax(path, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt),
+            );
+            return promise;
+        };
+        profiledFetch.__ttFteProfiled = true;
+        globalThis.fetch = profiledFetch;
+    } catch {
+        // Best-effort only.
+    }
+}
+
+/** Floating "Σ" button that re-shows the profiler report (double-tap hides). */
+function installProbeButton(profiler) {
+    try {
+        if (typeof document === 'undefined' || document.getElementById('tt-fte-probe')) {
+            return;
+        }
+        const button = document.createElement('div');
+        button.id = 'tt-fte-probe';
+        button.textContent = 'Σ';
+        button.title = 'Token Estimator 性能剖析（双击隐藏）';
+        Object.assign(button.style, {
+            position: 'fixed',
+            right: '14px',
+            bottom: '140px',
+            width: '34px',
+            height: '34px',
+            borderRadius: '50%',
+            background: 'rgba(90, 90, 110, 0.55)',
+            color: '#fff',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: '16px',
+            fontWeight: 'bold',
+            zIndex: '2147483000',
+            cursor: 'pointer',
+            userSelect: 'none',
+            opacity: '0.6',
+        });
+        let lastTap = 0;
+        button.addEventListener('click', () => {
+            const now = Date.now();
+            if (now - lastTap < 400) {
+                button.remove();
+                return;
+            }
+            lastTap = now;
+            profiler.reportNow();
+        });
+        document.body.appendChild(button);
+    } catch {
+        // Best-effort only.
+    }
+}
+
 if (typeof globalThis.jQuery !== 'undefined') {
     installFrontendTokenizer(globalThis.jQuery);
     const guard = activateFrontendTokenizerGuard(() => globalThis.jQuery, { notify: showNotification });
-    // Fast tick: the host and some extensions replace jQuery.ajax at startup,
-    // so a short window keeps leaked backend counts near zero.
-    const guardTimer = setInterval(() => guard.tick(), 300);
+    const profiler = createProfiler({
+        notify: (message) => showNotification(message, 30_000),
+        backendCountDelta: () => guard.backendCountDelta(),
+    });
+    activeProfiler = profiler;
+    globalThis.__TT_FRONTEND_TOKENIZER__.profile = () => profiler.snapshot();
+    observeLongTasks(profiler);
+    profileFetch(profiler);
+    installProbeButton(profiler);
+    // Fast tick: re-assert the interceptor quickly when displaced and drive
+    // the profiler window checks.
+    const guardTimer = setInterval(() => {
+        guard.tick();
+        profiler.tick();
+    }, PROFILE_TICK_MS);
     // Do not keep Node test contexts alive on account of the watchdog.
     guardTimer?.unref?.();
 }
